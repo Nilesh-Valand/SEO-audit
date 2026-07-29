@@ -10,10 +10,10 @@ from urllib.parse import urldefrag, urlparse
 import yaml
 from bs4 import BeautifulSoup
 from sqlalchemy import delete, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore, PageLink, PageVital, SitemapFinding
+from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore, PageLink, SitemapFinding
 
 SEVERITY_WEIGHTS = {
     "critical": 10,
@@ -51,7 +51,6 @@ class PageContext:
     h1_count: int
     text_hash: str | None
     has_mixed_content: bool
-    vitals: dict[str, PageVital]
 
 
 class RuleEngine:
@@ -69,9 +68,6 @@ class RuleEngine:
             "orphan_page": self._orphan_page,
             "missing_h1": self._missing_h1,
             "multiple_h1": self._multiple_h1,
-            "lcp_fail": self._lcp_fail,
-            "inp_fail": self._inp_fail,
-            "cls_fail": self._cls_fail,
             "thin_content": self._thin_content,
             "duplicate_content": self._duplicate_content,
             "missing_schema": self._missing_schema,
@@ -137,9 +133,8 @@ class RuleEngine:
         pages = db.scalars(
             select(CrawledPage)
             .where(CrawledPage.crawl_run_id == crawl_run_id)
-            .options(joinedload(CrawledPage.page_vitals))
             .order_by(CrawledPage.id.asc())
-        ).unique().all()
+        ).all()
 
         normalized_to_page = {self._normalize_url(page.url): page for page in pages}
         inbound_links = defaultdict(int)
@@ -157,7 +152,6 @@ class RuleEngine:
         for page in pages:
             normalized_url = self._normalize_url(page.url)
             h1_count, text_hash, mixed_content = self._snapshot_signals(page.raw_html_path, page.url)
-            vitals = {vital.strategy: vital for vital in page.page_vitals}
             contexts.append(
                 PageContext(
                     page=page,
@@ -166,7 +160,6 @@ class RuleEngine:
                     h1_count=h1_count,
                     text_hash=text_hash,
                     has_mixed_content=mixed_content,
-                    vitals=vitals,
                 )
             )
         return contexts
@@ -310,15 +303,6 @@ class RuleEngine:
             if page.h1_count > 1
         ]
 
-    def _lcp_fail(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
-        return self._vital_issues(rule, crawl_run_id, pages, "lcp_ms", 2500, "LCP is {value:.0f}ms.")
-
-    def _inp_fail(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
-        return self._vital_issues(rule, crawl_run_id, pages, "inp_ms", 200, "INP/TBT is {value:.0f}ms.")
-
-    def _cls_fail(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
-        return self._vital_issues(rule, crawl_run_id, pages, "cls", 0.1, "CLS is {value:.2f}.")
-
     def _thin_content(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
         return [
             self._page_issue(
@@ -395,7 +379,8 @@ class RuleEngine:
                 rule_id=rule.id,
                 category=rule.category,
                 severity=rule.severity,
-                message="URL is present in the sitemap but was not crawled in this run.",
+                message=finding.message
+                or "Sitemap URLs were not covered by this crawl. Increase max pages for broader coverage.",
             )
             for finding in findings
             if finding.finding_type == "in_sitemap_not_crawled"
@@ -445,33 +430,6 @@ class RuleEngine:
                         crawl_run_id,
                         page,
                         template.format(count=len(group)),
-                    )
-                )
-        return issues
-
-    def _vital_issues(
-        self,
-        rule: RuleDefinition,
-        crawl_run_id: int,
-        pages: list[PageContext],
-        field_name: str,
-        threshold: float,
-        message_template: str,
-    ) -> list[IssueRecord]:
-        issues: list[IssueRecord] = []
-        for page in pages:
-            candidates = [getattr(vital, field_name) for vital in page.vitals.values()]
-            values = [value for value in candidates if value is not None]
-            if not values:
-                continue
-            worst = max(values)
-            if worst > threshold:
-                issues.append(
-                    self._page_issue(
-                        rule,
-                        crawl_run_id,
-                        page,
-                        message_template.format(value=worst),
                     )
                 )
         return issues

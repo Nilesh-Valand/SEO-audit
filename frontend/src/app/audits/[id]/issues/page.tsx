@@ -2,6 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select } from "@/components/ui/select";
 import { ApiError } from "@/components/ApiError";
+import { AuditBackNav } from "@/components/AuditBackNav";
 import { apiClient } from "@/lib/api";
 
 export default async function AuditIssuesPage({
@@ -15,13 +16,19 @@ export default async function AuditIssuesPage({
   const page = Number(searchParams.page ?? "1");
 
   let issues;
+  let projectId: number | null = null;
   try {
-    issues = await apiClient.getIssues(auditId, {
-      category: searchParams.category,
-      severity: searchParams.severity,
-      page,
-      page_size: 25,
-    });
+    const [issuesResponse, crawlRun] = await Promise.all([
+      apiClient.getIssues(auditId, {
+        category: searchParams.category,
+        severity: searchParams.severity,
+        page,
+        page_size: 25,
+      }),
+      apiClient.getCrawlRun(auditId),
+    ]);
+    issues = issuesResponse;
+    projectId = crawlRun.project_id;
   } catch (error) {
     return (
       <div className="space-y-6 p-8">
@@ -33,6 +40,7 @@ export default async function AuditIssuesPage({
   return (
     <div className="space-y-6 p-8">
       <div>
+        <AuditBackNav auditId={auditId} projectId={projectId} active="issues" />
         <h1 className="text-3xl font-bold text-gray-900">Audit Issues</h1>
         <p className="mt-1 text-sm text-gray-500">Review, filter, and inspect all findings for this audit.</p>
       </div>

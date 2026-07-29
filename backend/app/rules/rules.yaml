@@ -48,21 +48,6 @@
   description: Page contains multiple H1 headings.
   severity: low
   condition: multiple_h1
-- id: lcp_fail
-  category: performance
-  description: Largest Contentful Paint is slower than recommended.
-  severity: high
-  condition: lcp_fail
-- id: inp_fail
-  category: performance
-  description: Interaction to Next Paint or fallback Total Blocking Time is too high.
-  severity: high
-  condition: inp_fail
-- id: cls_fail
-  category: performance
-  description: Cumulative Layout Shift is higher than recommended.
-  severity: medium
-  condition: cls_fail
 - id: thin_content
   category: content
   description: Page has thin visible content.
@@ -85,7 +70,7 @@
   condition: mixed_content
 - id: sitemap_orphan
   category: indexing
-  description: URL appears in sitemap but was not crawled.
+  description: Sitemap lists URLs that were not covered by this crawl.
   severity: medium
   condition: sitemap_orphan
 - id: crawled_not_in_sitemap

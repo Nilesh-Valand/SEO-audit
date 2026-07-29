@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
@@ -14,7 +14,8 @@ from app.crawler.storage import CrawlStorage
 from app.db.database import SessionLocal
 from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore
 from app.rules.engine import RuleEngine
-from app.services.crawl_runs import get_progress, is_active, start_crawl_run
+from app.services.crawl_runs import cancel_crawl_run, get_progress, is_active, start_crawl_run
+from app.services.deletions import delete_crawl_run
 from app.services.report import ReportService, iter_file_chunks, remove_file
 
 router = APIRouter(prefix="/crawl-runs", tags=["crawl-runs"])
@@ -28,7 +29,6 @@ class CreateCrawlRunRequest(BaseModel):
     start_url: HttpUrl
     max_pages: int = Field(default=200, ge=1, le=5000)
     max_depth: int = Field(default=3, ge=0, le=20)
-    enable_pagespeed: bool = True
 
 
 class CrawlRunResponse(BaseModel):
@@ -253,7 +253,6 @@ async def create_crawl_run(payload: CreateCrawlRunRequest) -> CrawlRunResponse:
         start_url=str(payload.start_url),
         max_pages=payload.max_pages,
         max_depth=payload.max_depth,
-        enable_pagespeed=payload.enable_pagespeed,
     )
 
     return CrawlRunResponse(crawl_run_id=crawl_run.id, status="pending")
@@ -271,6 +270,19 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
         finished_at=crawl_run.finished_at,
         active=is_active(crawl_run.id),
     )
+
+
+@router.delete("/{crawl_run_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def remove_crawl_run(crawl_run_id: int) -> Response:
+    cancel_crawl_run(crawl_run_id)
+    with SessionLocal() as db:
+        deleted = delete_crawl_run(db, crawl_run_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Crawl run {crawl_run_id} not found.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{crawl_run_id}/summary", response_model=CrawlRunSummaryResponse)
