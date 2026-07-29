@@ -206,7 +206,6 @@ export const apiClient = {
     start_url: string;
     max_pages: number;
     max_depth?: number;
-    enable_pagespeed?: boolean;
   }) => api.post<{ crawl_run_id: number; status: string }>("/api/crawl-runs", payload),
   deleteCrawlRun: (id: number) => api.delete(`/api/crawl-runs/${id}`),
   getCrawlRun: (id: number) =>

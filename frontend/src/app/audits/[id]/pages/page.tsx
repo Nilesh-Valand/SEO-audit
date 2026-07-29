@@ -2,6 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { ApiError } from "@/components/ApiError";
+import { AuditBackNav } from "@/components/AuditBackNav";
 import { apiClient } from "@/lib/api";
 
 export default async function AuditPagesPage({
@@ -22,16 +23,22 @@ export default async function AuditPagesPage({
   const page = Number(searchParams.page ?? "1");
 
   let pages;
+  let projectId: number | null = null;
   try {
-    pages = await apiClient.getPages(auditId, {
-      search: searchParams.search,
-      sort_by: searchParams.sort_by ?? "url",
-      sort_order: searchParams.sort_order ?? "asc",
-      status_code: searchParams.status_code ? Number(searchParams.status_code) : undefined,
-      issue_category: searchParams.issue_category,
-      page,
-      page_size: 50,
-    });
+    const [pagesResponse, crawlRun] = await Promise.all([
+      apiClient.getPages(auditId, {
+        search: searchParams.search,
+        sort_by: searchParams.sort_by ?? "url",
+        sort_order: searchParams.sort_order ?? "asc",
+        status_code: searchParams.status_code ? Number(searchParams.status_code) : undefined,
+        issue_category: searchParams.issue_category,
+        page,
+        page_size: 50,
+      }),
+      apiClient.getCrawlRun(auditId),
+    ]);
+    pages = pagesResponse;
+    projectId = crawlRun.project_id;
   } catch (error) {
     return (
       <div className="space-y-6 p-8">
@@ -43,6 +50,7 @@ export default async function AuditPagesPage({
   return (
     <div className="space-y-6 p-8">
       <div>
+        <AuditBackNav auditId={auditId} projectId={projectId} active="pages" />
         <h1 className="text-3xl font-bold text-gray-900">Crawled Pages</h1>
         <p className="mt-1 text-sm text-gray-500">Search and sort through every page discovered in this audit.</p>
       </div>

@@ -17,7 +17,6 @@ function normalizeUrl(value: string): string {
 export default function NewAuditPage() {
   const [domain, setDomain] = useState("");
   const [maxPages, setMaxPages] = useState(200);
-  const [enablePagespeed, setEnablePagespeed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<CrawlRunProgress | null>(null);
@@ -32,13 +31,9 @@ export default function NewAuditPage() {
 
   useEffect(() => {
     const maxPagesRaw = window.localStorage.getItem("seo_audit_default_max_pages");
-    const pagespeedRaw = window.localStorage.getItem("seo_audit_default_enable_pagespeed");
     if (maxPagesRaw) {
       const parsed = Number(maxPagesRaw);
       if (!Number.isNaN(parsed) && parsed > 0) setMaxPages(parsed);
-    }
-    if (pagespeedRaw !== null) {
-      setEnablePagespeed(pagespeedRaw === "true");
     }
 
     return () => {
@@ -73,7 +68,6 @@ export default function NewAuditPage() {
         project_id: project.id,
         start_url: startUrl,
         max_pages: maxPages,
-        enable_pagespeed: enablePagespeed,
       });
       setCreatedRunId(crawlRun.crawl_run_id);
       setProgress({
@@ -96,9 +90,7 @@ export default function NewAuditPage() {
               pollRef.current = null;
             }
             if (nextProgress.status === "failed") {
-              setError(
-                "Crawl failed. This is usually a temporary crawler/browser issue — try again. HTML crawling should still work after the latest fix.",
-              );
+              setError("Crawl failed. Try again with a smaller max-pages value or a different URL.");
             }
           }
         } catch (err) {
@@ -149,16 +141,10 @@ export default function NewAuditPage() {
                 value={maxPages}
                 onChange={(event) => setMaxPages(Number(event.target.value))}
               />
+              <p className="text-xs text-gray-500">
+                Large sites (like Shopify) have huge sitemaps. Raise max pages if you need broader coverage.
+              </p>
             </div>
-
-            <label className="flex items-center gap-3 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700">
-              <input
-                type="checkbox"
-                checked={enablePagespeed}
-                onChange={(event) => setEnablePagespeed(event.target.checked)}
-              />
-              Enable PageSpeed enrichment after the crawl
-            </label>
 
             {error ? <div className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
 

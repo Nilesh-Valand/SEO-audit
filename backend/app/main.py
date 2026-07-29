@@ -12,7 +12,6 @@ if sys.platform.startswith("win"):
 
 from app.config import settings
 from app.api.crawl_runs import router as crawl_runs_router
-from app.api.gsc import router as gsc_router
 from app.api.health import router as health_router
 from app.api.projects import router as projects_router
 
@@ -29,4 +28,3 @@ app.add_middleware(
 app.include_router(health_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(crawl_runs_router, prefix="/api")
-app.include_router(gsc_router, prefix="/api")

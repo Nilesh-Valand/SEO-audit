@@ -8,27 +8,21 @@ import { getApiUrl } from "@/lib/api";
 
 const STORAGE_KEYS = {
   defaultMaxPages: "seo_audit_default_max_pages",
-  defaultEnablePagespeed: "seo_audit_default_enable_pagespeed",
 };
 
 type ConnectionState = "checking" | "online" | "offline";
 
 export default function SettingsPage() {
   const [defaultMaxPages, setDefaultMaxPages] = useState(200);
-  const [defaultEnablePagespeed, setDefaultEnablePagespeed] = useState(false);
   const [saved, setSaved] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [apiBase, setApiBase] = useState("");
 
   useEffect(() => {
     const maxPagesRaw = window.localStorage.getItem(STORAGE_KEYS.defaultMaxPages);
-    const pagespeedRaw = window.localStorage.getItem(STORAGE_KEYS.defaultEnablePagespeed);
     if (maxPagesRaw) {
       const parsed = Number(maxPagesRaw);
       if (!Number.isNaN(parsed) && parsed > 0) setDefaultMaxPages(parsed);
-    }
-    if (pagespeedRaw !== null) {
-      setDefaultEnablePagespeed(pagespeedRaw === "true");
     }
 
     setApiBase(getApiUrl(""));
@@ -48,10 +42,6 @@ export default function SettingsPage() {
   function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     window.localStorage.setItem(STORAGE_KEYS.defaultMaxPages, String(defaultMaxPages));
-    window.localStorage.setItem(
-      STORAGE_KEYS.defaultEnablePagespeed,
-      String(defaultEnablePagespeed),
-    );
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2000);
   }
@@ -111,15 +101,6 @@ export default function SettingsPage() {
               />
             </div>
 
-            <label className="flex items-center gap-3 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-700">
-              <input
-                type="checkbox"
-                checked={defaultEnablePagespeed}
-                onChange={(event) => setDefaultEnablePagespeed(event.target.checked)}
-              />
-              Enable PageSpeed by default on new audits
-            </label>
-
             <div className="flex items-center gap-3">
               <Button type="submit">Save preferences</Button>
               {saved ? <span className="text-sm text-emerald-700">Saved</span> : null}
@@ -130,28 +111,15 @@ export default function SettingsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Enrichment integrations</CardTitle>
+          <CardTitle>How audits work</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 text-sm text-gray-600">
           <p>
-            PageSpeed and Google Search Console are controlled by backend flags in{" "}
-            <code className="rounded bg-gray-100 px-1">backend/.env</code>:
+            Audits use crawled HTML only — no PageSpeed or Google API keys are required.
+            After each crawl we compare the sitemap to crawled URLs and run technical SEO rules.
           </p>
-          <ul className="list-disc space-y-2 pl-5">
-            <li>
-              <code className="rounded bg-gray-100 px-1">ENRICHMENT_ENABLE_PAGESPEED</code> — set to{" "}
-              <code className="rounded bg-gray-100 px-1">true</code> and add{" "}
-              <code className="rounded bg-gray-100 px-1">PAGESPEED_API_KEY</code> to collect CWV metrics.
-            </li>
-            <li>
-              <code className="rounded bg-gray-100 px-1">ENRICHMENT_ENABLE_GSC</code> — set to{" "}
-              <code className="rounded bg-gray-100 px-1">true</code> and configure Google OAuth credentials
-              to pull Search Console data. Sitemap comparison still runs without GSC.
-            </li>
-          </ul>
           <p>
-            With both flags off, audits still produce full crawl-based reports (titles, links, content,
-            sitemap gaps, and more).
+            Backend settings live in <code className="rounded bg-gray-100 px-1">backend/.env</code>.
           </p>
         </CardContent>
       </Card>

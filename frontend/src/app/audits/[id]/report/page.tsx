@@ -2,6 +2,7 @@ import { ExportDropdown } from "@/components/ExportDropdown";
 import { ScoreGauge } from "@/components/charts/ScoreGauge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ApiError } from "@/components/ApiError";
+import { AuditBackNav } from "@/components/AuditBackNav";
 import { apiClient, getApiUrl } from "@/lib/api";
 
 export default async function AuditReportPage({
@@ -26,6 +27,11 @@ export default async function AuditReportPage({
     <div className="space-y-8 bg-white p-8 print:p-0">
       <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
+          <AuditBackNav
+            auditId={auditId}
+            projectId={report.project.id}
+            active="report"
+          />
           <h1 className="text-3xl font-bold text-gray-900">{report.project.domain ?? "Audit Report"}</h1>
           <p className="mt-1 text-sm text-gray-500">Printable and shareable audit summary.</p>
         </div>
