@@ -1,0 +1,95 @@
+- id: missing_title
+  category: technical
+  description: Page is missing a title tag.
+  severity: high
+  condition: missing_title
+- id: duplicate_title
+  category: technical
+  description: Title is duplicated across multiple pages.
+  severity: medium
+  condition: duplicate_title
+- id: missing_meta_description
+  category: technical
+  description: Page is missing a meta description.
+  severity: medium
+  condition: missing_meta_description
+- id: duplicate_meta_description
+  category: technical
+  description: Meta description is duplicated across multiple pages.
+  severity: low
+  condition: duplicate_meta_description
+- id: broken_link
+  category: technical
+  description: Page returned a 4xx or 5xx response.
+  severity: high
+  condition: broken_link
+- id: redirect_chain
+  category: technical
+  description: URL required 3 or more redirects before resolving.
+  severity: medium
+  condition: redirect_chain
+- id: canonical_noindex_conflict
+  category: technical
+  description: Page sets a canonical URL while also using noindex.
+  severity: high
+  condition: canonical_noindex_conflict
+- id: orphan_page
+  category: technical
+  description: Page has no inbound internal links from other crawled pages.
+  severity: medium
+  condition: orphan_page
+- id: missing_h1
+  category: technical
+  description: Page is missing an H1 heading.
+  severity: medium
+  condition: missing_h1
+- id: multiple_h1
+  category: technical
+  description: Page contains multiple H1 headings.
+  severity: low
+  condition: multiple_h1
+- id: lcp_fail
+  category: performance
+  description: Largest Contentful Paint is slower than recommended.
+  severity: high
+  condition: lcp_fail
+- id: inp_fail
+  category: performance
+  description: Interaction to Next Paint or fallback Total Blocking Time is too high.
+  severity: high
+  condition: inp_fail
+- id: cls_fail
+  category: performance
+  description: Cumulative Layout Shift is higher than recommended.
+  severity: medium
+  condition: cls_fail
+- id: thin_content
+  category: content
+  description: Page has thin visible content.
+  severity: medium
+  condition: thin_content
+- id: duplicate_content
+  category: content
+  description: Page content appears duplicated across multiple URLs.
+  severity: high
+  condition: duplicate_content
+- id: missing_schema
+  category: structured_data
+  description: Page type likely needs schema but none was found.
+  severity: medium
+  condition: missing_schema
+- id: mixed_content
+  category: security
+  description: HTTPS page references insecure HTTP resources.
+  severity: critical
+  condition: mixed_content
+- id: sitemap_orphan
+  category: indexing
+  description: URL appears in sitemap but was not crawled.
+  severity: medium
+  condition: sitemap_orphan
+- id: crawled_not_in_sitemap
+  category: indexing
+  description: Crawled URL does not appear in the sitemap.
+  severity: low
+  condition: crawled_not_in_sitemap
