@@ -56,6 +56,9 @@ def start_crawl_run(
             except Exception as exc:
                 logger.warning("Auto audit failed for crawl run %s: %s", crawl_run_id, exc)
             storage.set_run_completed(crawl_run_id)
+        except asyncio.CancelledError:
+            storage.set_run_failed(crawl_run_id)
+            raise
         except Exception as exc:
             logger.exception("Crawl run %s failed: %s", crawl_run_id, exc)
             storage.set_run_failed(crawl_run_id)
@@ -67,3 +70,12 @@ def start_crawl_run(
     task.add_done_callback(
         lambda _: (_ACTIVE_TASKS.pop(crawl_run_id, None), _ACTIVE_PROGRESS.pop(crawl_run_id, None))
     )
+
+
+def cancel_crawl_run(crawl_run_id: int) -> bool:
+    task = _ACTIVE_TASKS.get(crawl_run_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+

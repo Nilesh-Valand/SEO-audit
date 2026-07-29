@@ -31,6 +31,16 @@ export default function NewAuditPage() {
   }, [progress, maxPages]);
 
   useEffect(() => {
+    const maxPagesRaw = window.localStorage.getItem("seo_audit_default_max_pages");
+    const pagespeedRaw = window.localStorage.getItem("seo_audit_default_enable_pagespeed");
+    if (maxPagesRaw) {
+      const parsed = Number(maxPagesRaw);
+      if (!Number.isNaN(parsed) && parsed > 0) setMaxPages(parsed);
+    }
+    if (pagespeedRaw !== null) {
+      setEnablePagespeed(pagespeedRaw === "true");
+    }
+
     return () => {
       if (pollRef.current !== null) {
         window.clearInterval(pollRef.current);
@@ -174,11 +184,20 @@ export default function NewAuditPage() {
             </div>
             {progress.status === "completed" ? (
               <div className="rounded-lg bg-green-50 px-4 py-3 text-sm text-green-700">
-                Crawl completed successfully.
+                Crawl completed successfully. Open the dashboard or report to review findings.
               </div>
             ) : null}
             {createdRunId ? (
-              <div className="flex gap-3">
+              <div className="flex flex-wrap gap-3">
+                <a className="text-sm font-medium text-brand-600 hover:underline" href="/dashboard">
+                  All projects
+                </a>
+                <a className="text-sm font-medium text-brand-600 hover:underline" href="/reports">
+                  All reports
+                </a>
+                <a className="text-sm font-medium text-brand-600 hover:underline" href={`/audits/${createdRunId}/report`}>
+                  View report
+                </a>
                 <a className="text-sm font-medium text-brand-600 hover:underline" href={`/audits/${createdRunId}/issues`}>
                   View issues
                 </a>
@@ -187,7 +206,7 @@ export default function NewAuditPage() {
                 </a>
                 {createdProjectId ? (
                   <a className="text-sm font-medium text-brand-600 hover:underline" href={`/dashboard/${createdProjectId}`}>
-                    Open dashboard
+                    Open project
                   </a>
                 ) : null}
               </div>
