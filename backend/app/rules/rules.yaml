@@ -33,6 +33,31 @@
   description: Page sets a canonical URL while also using noindex.
   severity: high
   condition: canonical_noindex_conflict
+- id: missing_canonical
+  category: technical
+  description: Page is missing a link rel=canonical tag.
+  severity: medium
+  condition: missing_canonical
+- id: self_canonical_mismatch
+  category: technical
+  description: Canonical URL does not match the page's own normalized URL (excluding common pagination patterns).
+  severity: medium
+  condition: self_canonical_mismatch
+- id: broken_canonical_url
+  category: technical
+  description: Canonical URL is malformed or resolves to a 4xx/5xx response.
+  severity: high
+  condition: broken_canonical_url
+- id: canonical_points_to_redirect
+  category: technical
+  description: Canonical URL returns a 3xx redirect instead of resolving directly.
+  severity: high
+  condition: canonical_points_to_redirect
+- id: canonical_points_to_noindex
+  category: technical
+  description: Canonical target page includes a meta robots noindex directive.
+  severity: high
+  condition: canonical_points_to_noindex
 - id: orphan_page
   category: technical
   description: Page has no inbound internal links from other crawled pages.

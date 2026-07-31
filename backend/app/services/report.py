@@ -15,6 +15,7 @@ from sqlalchemy.orm import joinedload
 
 from app.db.database import SessionLocal
 from app.models import AuditIssue, CrawlRun, CrawlRunScore, Project
+from app.rules.recommendations import recommendation_for_rule
 
 # Same weights as RuleEngine scoring: impact = weight × pages affected.
 SEVERITY_WEIGHTS = {
@@ -70,7 +71,7 @@ class ReportService:
                         "rule": issue.rule_id,
                         "severity": issue.severity,
                         "category": issue.category,
-                        "message": issue.message,
+                        "message": recommendation_for_rule(issue.rule_id, issue.message),
                         "pages_affected": 0,
                     }
                 recommendation_groups[recommendation_key]["pages_affected"] += 1

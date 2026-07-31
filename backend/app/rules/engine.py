@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -8,11 +9,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urldefrag, urlparse
 
+import httpx
 import yaml
 from bs4 import BeautifulSoup
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, joinedload
 
+from app.config import settings
 from app.rules.schema_validation import validate_schema_blocks
 from app.crawler.normalize import normalize_url
 from app.db.database import SessionLocal
@@ -26,6 +29,8 @@ from app.models import (
     PageVital,
     SitemapFinding,
 )
+
+logger = logging.getLogger(__name__)
 
 SEVERITY_WEIGHTS = {
     "critical": 10,
@@ -44,6 +49,8 @@ OUTDATED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 KEYWORD_CANNIBALIZATION_THRESHOLD = 0.8
 LONG_FORM_WORD_COUNT = 800
 ANSWER_FIRST_MIN_WORDS = 20
+_PAGINATION_QUERY_KEYS = {"page", "p", "paged", "offset", "start"}
+_PAGINATION_PATH_RE = re.compile(r"/page/\d+/?$", re.IGNORECASE)
 
 TRACKING_QUERY_PARAMS = {
     "utm_source",
@@ -99,6 +106,17 @@ class PageContext:
     technical: PageTechnicalDetails | None = None
 
 
+@dataclass(slots=True)
+class CanonicalTargetProbe:
+    """Cached lightweight HEAD/GET result for a canonical target URL."""
+
+    url: str
+    malformed: bool = False
+    status_code: int | None = None
+    is_redirect: bool = False
+    error: str | None = None
+
+
 class RuleEngine:
     def __init__(self, rules_path: str | Path | None = None) -> None:
         self.rules_path = Path(rules_path or Path(__file__).with_name("rules.yaml"))
@@ -111,6 +129,11 @@ class RuleEngine:
             "broken_link": self._broken_link,
             "redirect_chain": self._redirect_chain,
             "canonical_noindex_conflict": self._canonical_noindex_conflict,
+            "missing_canonical": self._missing_canonical,
+            "self_canonical_mismatch": self._self_canonical_mismatch,
+            "broken_canonical_url": self._broken_canonical_url,
+            "canonical_points_to_redirect": self._canonical_points_to_redirect,
+            "canonical_points_to_noindex": self._canonical_points_to_noindex,
             "orphan_page": self._orphan_page,
             "missing_h1": self._missing_h1,
             "multiple_h1": self._multiple_h1,
@@ -154,6 +177,7 @@ class RuleEngine:
             "poor_content_structure": self._poor_content_structure,
         }
         self._current_crawl_run: CrawlRun | None = None
+        self._canonical_probe_cache: dict[str, CanonicalTargetProbe] = {}
 
     def run(self, crawl_run_id: int) -> dict[str, int]:
         with SessionLocal() as db:
@@ -173,6 +197,7 @@ class RuleEngine:
             db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_run_id == crawl_run_id))
 
             self._current_crawl_run = crawl_run
+            self._canonical_probe_cache.clear()
             issues: list[IssueRecord] = []
             try:
                 for rule in self.rules:
@@ -182,6 +207,7 @@ class RuleEngine:
                     issues.extend(check(rule, crawl_run_id, page_contexts, findings))
             finally:
                 self._current_crawl_run = None
+                self._canonical_probe_cache.clear()
 
             for issue in issues:
                 db.add(
@@ -418,6 +444,256 @@ class RuleEngine:
             for page in pages
             if page.page.canonical_url and "noindex" in (page.page.meta_robots or "").lower()
         ]
+
+    def _missing_canonical(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return [
+            self._page_issue(rule, crawl_run_id, page, "Page is missing a <link rel=\"canonical\"> tag.")
+            for page in pages
+            if self._is_likely_html_document(page) and not (page.page.canonical_url or "").strip()
+        ]
+
+    def _self_canonical_mismatch(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            raw_canonical = (page.page.canonical_url or "").strip()
+            if not raw_canonical or not self._is_likely_html_document(page):
+                continue
+            if self._is_malformed_url(raw_canonical):
+                continue
+            page_norm = page.normalized_url
+            canon_norm = self._normalize_url(raw_canonical)
+            if not canon_norm or page_norm == canon_norm:
+                continue
+            if self._is_pagination_canonical(page_norm, canon_norm):
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Canonical points to {canon_norm} instead of this page's URL ({page_norm}).",
+                )
+            )
+        return issues
+
+    def _broken_canonical_url(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        pages_by_url = {page.normalized_url: page for page in pages}
+        issues: list[IssueRecord] = []
+        for page in pages:
+            raw_canonical = (page.page.canonical_url or "").strip()
+            if not raw_canonical or not self._is_likely_html_document(page):
+                continue
+            if self._is_malformed_url(raw_canonical):
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        f"Canonical URL is malformed: {raw_canonical}",
+                    )
+                )
+                continue
+
+            canon_norm = self._normalize_url(raw_canonical)
+            target = pages_by_url.get(canon_norm)
+            if target is not None:
+                status = target.page.status_code
+                if status is not None and status >= 400:
+                    issues.append(
+                        self._page_issue(
+                            rule,
+                            crawl_run_id,
+                            page,
+                            f"Canonical target {canon_norm} returned status {status} in this crawl.",
+                        )
+                    )
+                continue
+
+            probe = self._probe_canonical_target(raw_canonical)
+            if probe.malformed:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        f"Canonical URL is malformed: {raw_canonical}",
+                    )
+                )
+                continue
+            if probe.status_code is not None and probe.status_code >= 400 and not probe.is_redirect:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        f"Canonical target {canon_norm} returned status {probe.status_code}.",
+                    )
+                )
+        return issues
+
+    def _canonical_points_to_redirect(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        pages_by_url = {page.normalized_url: page for page in pages}
+        issues: list[IssueRecord] = []
+        for page in pages:
+            raw_canonical = (page.page.canonical_url or "").strip()
+            if not raw_canonical or not self._is_likely_html_document(page):
+                continue
+            if self._is_malformed_url(raw_canonical):
+                continue
+
+            canon_norm = self._normalize_url(raw_canonical)
+            target = pages_by_url.get(canon_norm)
+            if target is not None:
+                if target.page.redirect_hops >= 1:
+                    issues.append(
+                        self._page_issue(
+                            rule,
+                            crawl_run_id,
+                            page,
+                            f"Canonical target {canon_norm} required {target.page.redirect_hops} redirect hop(s) during crawl.",
+                        )
+                    )
+                continue
+
+            probe = self._probe_canonical_target(raw_canonical)
+            if probe.is_redirect and probe.status_code is not None:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        f"Canonical target {canon_norm} returned HTTP {probe.status_code} (redirect).",
+                    )
+                )
+        return issues
+
+    def _canonical_points_to_noindex(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        pages_by_url = {page.normalized_url: page for page in pages}
+        issues: list[IssueRecord] = []
+        for page in pages:
+            raw_canonical = (page.page.canonical_url or "").strip()
+            if not raw_canonical or not self._is_likely_html_document(page):
+                continue
+            if self._is_malformed_url(raw_canonical):
+                continue
+
+            canon_norm = self._normalize_url(raw_canonical)
+            target = pages_by_url.get(canon_norm)
+            if target is None:
+                continue
+            # Self-canonical + noindex is covered by canonical_noindex_conflict.
+            if target.normalized_url == page.normalized_url:
+                continue
+            if "noindex" not in (target.page.meta_robots or "").lower():
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Canonical target {canon_norm} includes meta robots noindex.",
+                )
+            )
+        return issues
+
+    def _is_likely_html_document(self, page: PageContext) -> bool:
+        status = page.page.status_code
+        if status is not None and status >= 400:
+            return False
+        return True
+
+    def _is_malformed_url(self, url: str) -> bool:
+        cleaned = (url or "").strip()
+        if not cleaned:
+            return True
+        parsed = urlparse(cleaned)
+        if parsed.scheme not in {"http", "https"}:
+            return True
+        if not parsed.netloc:
+            return True
+        return False
+
+    def _is_pagination_canonical(self, page_url: str, canonical_url: str) -> bool:
+        """True when page N+ intentionally canonicalizes to page 1 / hub."""
+        page_parsed = urlparse(page_url)
+        canon_parsed = urlparse(canonical_url)
+        page_qs = parse_qs(page_parsed.query, keep_blank_values=False)
+        canon_qs = parse_qs(canon_parsed.query, keep_blank_values=False)
+
+        for key in _PAGINATION_QUERY_KEYS:
+            if key not in page_qs:
+                continue
+            try:
+                page_n = int(str(page_qs[key][0]))
+            except (TypeError, ValueError):
+                continue
+            if page_n <= 1:
+                continue
+            if key not in canon_qs:
+                return True
+            try:
+                canon_n = int(str(canon_qs[key][0]))
+            except (TypeError, ValueError):
+                continue
+            if canon_n == 1:
+                return True
+
+        if _PAGINATION_PATH_RE.search(page_parsed.path or ""):
+            canon_path = canon_parsed.path or ""
+            if not _PAGINATION_PATH_RE.search(canon_path):
+                return True
+            if re.search(r"/page/1/?$", canon_path, re.IGNORECASE):
+                return True
+        return False
+
+    def _probe_canonical_target(self, url: str) -> CanonicalTargetProbe:
+        cache_key = self._normalize_url(url) or url.strip()
+        cached = self._canonical_probe_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self._is_malformed_url(url):
+            probe = CanonicalTargetProbe(url=url, malformed=True)
+            self._canonical_probe_cache[cache_key] = probe
+            return probe
+
+        headers = {"User-Agent": settings.CRAWLER_USER_AGENT}
+        timeout = httpx.Timeout(15.0, connect=8.0)
+        try:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=False,
+            ) as client:
+                response = self._head_or_get(client, url)
+                status = response.status_code
+                probe = CanonicalTargetProbe(
+                    url=url,
+                    status_code=status,
+                    is_redirect=300 <= status < 400,
+                )
+        except Exception as exc:
+            logger.debug("Canonical target probe failed for %s: %s", url, exc)
+            probe = CanonicalTargetProbe(url=url, error=str(exc))
+
+        self._canonical_probe_cache[cache_key] = probe
+        return probe
+
+    def _head_or_get(self, client: httpx.Client, url: str) -> httpx.Response:
+        response = client.head(url)
+        if response.status_code in {405, 501}:
+            return client.get(url)
+        return response
 
     def _orphan_page(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
         return [
