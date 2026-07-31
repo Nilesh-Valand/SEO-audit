@@ -8,11 +8,14 @@ from datetime import datetime, UTC
 from pathlib import Path
 
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.models import CrawledPage, CrawlRun, PageLink, Project
+from app.models import CrawledPage, CrawlRun, PageLink, PageTechnicalDetails, Project
 from app.crawler.extractor import ExtractedPage
+from app.crawler.normalize import normalize_url
+from app.paths import SNAPSHOT_ROOT
 
 SessionFactory = Callable[[], Session]
 
@@ -33,9 +36,10 @@ class CrawlStorage:
     ) -> None:
         self._session_factory = session_factory
         self._flush_size = flush_size
-        self._snapshot_root = snapshot_root or (Path(__file__).resolve().parents[1] / "db" / "snapshots")
+        self._snapshot_root = snapshot_root or SNAPSHOT_ROOT
         self._buffer: list[PendingPage] = []
         self._lock = asyncio.Lock()
+        self._snapshot_root.mkdir(parents=True, exist_ok=True)
 
     async def add(self, crawl_run_id: int, page: ExtractedPage) -> None:
         async with self._lock:
@@ -115,6 +119,34 @@ class CrawlStorage:
             finished_at=datetime.now(UTC),
         )
 
+    def save_site_checks(
+        self,
+        crawl_run_id: int,
+        *,
+        robots_txt_found: bool,
+        robots_txt_valid: bool | None,
+        robots_txt_ai_disallowed: list[str],
+        robots_txt_raw: str | None,
+        llms_txt_present: bool,
+        soft_404=None,
+    ) -> None:
+        with self._session_factory() as db:
+            crawl_run = db.get(CrawlRun, crawl_run_id)
+            if crawl_run is None:
+                return
+            crawl_run.robots_txt_found = robots_txt_found
+            crawl_run.robots_txt_valid = robots_txt_valid
+            crawl_run.robots_txt_ai_disallowed = list(robots_txt_ai_disallowed)
+            crawl_run.robots_txt_raw = robots_txt_raw
+            crawl_run.llms_txt_present = llms_txt_present
+            if soft_404 is not None:
+                crawl_run.soft_404_probe_url = soft_404.url
+                crawl_run.soft_404_status_code = soft_404.status_code
+                crawl_run.soft_404_word_count = soft_404.word_count
+                crawl_run.soft_404_is_soft = soft_404.is_soft
+                crawl_run.soft_404_detail = soft_404.detail
+            db.commit()
+
     def _update_run_status(
         self,
         crawl_run_id: int,
@@ -138,31 +170,50 @@ class CrawlStorage:
         if not batch:
             return 0
 
+        written = 0
         with self._session_factory() as db:
             run_counts: dict[int, int] = {}
             for item in batch:
                 page = item.page
-                html_path = self._save_html_snapshot(item.crawl_run_id, page.url, page.html)
-                page_row = CrawledPage(
-                    crawl_run_id=item.crawl_run_id,
-                    url=page.url,
-                    status_code=page.status_code,
-                    title=page.title,
-                    meta_description=page.meta_description,
-                    canonical_url=page.canonical_url,
-                    meta_robots=page.meta_robots,
-                    h1=page.primary_h1,
-                    word_count=page.word_count,
-                    response_time_ms=page.response_time_ms,
-                    redirect_hops=page.redirect_hops,
-                    is_indexable=page.is_indexable,
-                    has_schema=page.has_schema,
-                    js_rendered=page.js_rendered,
-                    rendered_diff_significant=page.rendered_diff_significant,
-                    raw_html_path=html_path,
+                canonical_url = normalize_url(page.url)
+                raw_url = page.raw_url or page.url
+                html_path = self._save_html_snapshot(item.crawl_run_id, canonical_url, page.html)
+
+                insert_stmt = (
+                    sqlite_insert(CrawledPage)
+                    .values(
+                        crawl_run_id=item.crawl_run_id,
+                        url=canonical_url,
+                        raw_url=raw_url if raw_url != canonical_url else None,
+                        status_code=page.status_code,
+                        title=page.title,
+                        meta_description=page.meta_description,
+                        canonical_url=page.canonical_url,
+                        meta_robots=page.meta_robots,
+                        h1=page.primary_h1,
+                        word_count=page.word_count,
+                        response_time_ms=page.response_time_ms,
+                        redirect_hops=page.redirect_hops,
+                        is_indexable=page.is_indexable,
+                        has_schema=page.has_schema,
+                        js_rendered=page.js_rendered,
+                        rendered_diff_significant=page.rendered_diff_significant,
+                        raw_html_path=html_path,
+                    )
+                    .on_conflict_do_nothing(index_elements=["crawl_run_id", "url"])
                 )
-                db.add(page_row)
-                db.flush()
+                result = db.execute(insert_stmt)
+                if not result.rowcount:
+                    continue
+
+                page_row = db.scalar(
+                    select(CrawledPage).where(
+                        CrawledPage.crawl_run_id == item.crawl_run_id,
+                        CrawledPage.url == canonical_url,
+                    )
+                )
+                if page_row is None:
+                    continue
 
                 for link in page.links:
                     db.add(
@@ -174,7 +225,54 @@ class CrawlStorage:
                         )
                     )
 
+                db.add(
+                    PageTechnicalDetails(
+                        crawled_page_id=page_row.id,
+                        url_has_uppercase=page.url_has_uppercase,
+                        url_has_underscore=page.url_has_underscore,
+                        url_length=page.url_length,
+                        url_has_query_params=page.url_has_query_params,
+                        og_title=page.og_title,
+                        og_description=page.og_description,
+                        og_image=page.og_image,
+                        twitter_card=page.twitter_card,
+                        twitter_title=page.twitter_title,
+                        html_lang=page.html_lang,
+                        favicon_present=bool(page.favicon_present),
+                        images_json=[
+                            {
+                                "src": image.src,
+                                "alt": image.alt,
+                                "has_width": image.has_width,
+                                "has_height": image.has_height,
+                                "file_extension": image.file_extension,
+                                "width": image.width,
+                                "height": image.height,
+                                "size_bytes": image.size_bytes,
+                            }
+                            for image in page.images
+                        ],
+                        schema_json=[
+                            {
+                                "raw": block.raw,
+                                "parsed": block.parsed,
+                                "parse_error": block.parsed is None,
+                            }
+                            for block in page.schema_blocks
+                        ],
+                        total_page_weight_bytes=page.total_page_weight_bytes,
+                        resource_request_count=page.resource_request_count,
+                        render_blocking_scripts_in_head=page.render_blocking_scripts_in_head,
+                        stylesheets_in_head=page.stylesheets_in_head,
+                        redirect_chain_json=[
+                            {"url": hop.url, "status_code": hop.status_code}
+                            for hop in page.redirect_chain
+                        ],
+                    )
+                )
+
                 run_counts[item.crawl_run_id] = run_counts.get(item.crawl_run_id, 0) + 1
+                written += 1
 
             if run_counts:
                 runs = db.scalars(select(CrawlRun).where(CrawlRun.id.in_(list(run_counts)))).all()
@@ -183,7 +281,7 @@ class CrawlStorage:
 
             db.commit()
 
-        return len(batch)
+        return written
 
     def _save_html_snapshot(self, crawl_run_id: int, url: str, html: str | None) -> str | None:
         if html is None:

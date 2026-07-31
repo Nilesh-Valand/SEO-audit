@@ -10,16 +10,24 @@ venv/
 backend/app/db/*.db
 backend/app/db/*.db-shm
 backend/app/db/*.db-wal
+backend/app/db/snapshots/
 
-# Node / Next.js
-node_modules/
-.next/
-frontend/.env.local
-frontend/out/
+# Crawl HTML snapshots (sibling of app/; keep folder via .gitkeep)
+backend/data/*
+!backend/data/snapshots/
+backend/data/snapshots/*
+!backend/data/snapshots/.gitkeep
 
-# Docker
+# Legacy crawl snapshot location (repo root)
+.crawl_data/
+
+# Chrome extension build artifacts
+extension/node_modules/
+extension/dist/
+extension/releases/
+extension/*.zip
+
+# Logs / OS
 *.log
-
-# OS
 .DS_Store
 Thumbs.db

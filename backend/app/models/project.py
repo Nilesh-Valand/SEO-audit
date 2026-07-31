@@ -17,9 +17,3 @@ class Project(Base):
     crawl_runs: Mapped[list["CrawlRun"]] = relationship(  # noqa: F821
         back_populates="project", cascade="all, delete-orphan"
     )
-    gsc_snapshots: Mapped[list["GscSnapshot"]] = relationship(  # noqa: F821
-        back_populates="project", cascade="all, delete-orphan"
-    )
-    gsc_credential: Mapped["GscCredential | None"] = relationship(  # noqa: F821
-        back_populates="project", cascade="all, delete-orphan", uselist=False
-    )

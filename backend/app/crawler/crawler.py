@@ -12,10 +12,20 @@ import httpx
 from protego import Protego
 
 from app.config import settings
-from app.crawler.extractor import ExtractedPage, extract_page_data, rendered_content_differs
+from app.crawler.extractor import (
+    ExtractedPage,
+    RedirectHop,
+    extract_page_data,
+    rendered_content_differs,
+)
+from app.crawler.site_checks import run_site_checks
 from app.crawler.storage import CrawlStorage
+from app.crawler.normalize import normalize_url, prefer_www_from_seed
 
 logger = logging.getLogger(__name__)
+
+# Cap resource HEADs used for approximate page weight.
+_MAX_WEIGHT_RESOURCES = 40
 
 try:
     from playwright.async_api import Browser, Error as PlaywrightError, async_playwright
@@ -66,6 +76,7 @@ class CrawlerService:
         self.render_js_when_thin = render_js_when_thin
         self.progress_callback = progress_callback
         self.flush_interval = settings.CRAWLER_FLUSH_INTERVAL
+        self.prefer_www = prefer_www_from_seed(start_url)
 
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._last_request_at: dict[str, float] = {}
@@ -85,37 +96,70 @@ class CrawlerService:
             timeout=timeout,
             headers=headers,
         ) as client:
+            try:
+                site_checks = await run_site_checks(client, start_url=self.start_url)
+                self.storage.save_site_checks(
+                    crawl_run_id,
+                    robots_txt_found=site_checks.robots_txt_found,
+                    robots_txt_valid=site_checks.robots_txt_valid,
+                    robots_txt_ai_disallowed=site_checks.robots_txt_ai_disallowed,
+                    robots_txt_raw=site_checks.robots_txt_raw,
+                    llms_txt_present=site_checks.llms_txt_present,
+                    soft_404=site_checks.soft_404,
+                )
+            except Exception as exc:
+                logger.warning("Site checks failed for crawl run %s: %s", crawl_run_id, exc)
+
             flush_stop = asyncio.Event()
             flush_task = asyncio.create_task(self._periodic_flush(flush_stop))
-            queue: deque[tuple[str, int]] = deque([(self.start_url, 0)])
+            start = normalize_url(self.start_url, prefer_www=self.prefer_www)
+            queue: deque[tuple[str, int]] = deque([(start, 0)])
             visited: set[str] = set()
+            stored_urls: set[str] = set()
 
             try:
-                while queue and len(visited) < self.max_pages:
+                while queue and len(stored_urls) < self.max_pages:
                     current_depth = queue[0][1]
                     level: list[str] = []
 
                     while (
                         queue
                         and queue[0][1] == current_depth
-                        and len(visited) + len(level) < self.max_pages
+                        and len(stored_urls) + len(level) < self.max_pages
                     ):
                         url, _ = queue.popleft()
-                        if url in visited:
+                        key = normalize_url(url, prefer_www=self.prefer_www)
+                        if key in visited:
                             continue
-                        visited.add(url)
-                        level.append(url)
+                        visited.add(key)
+                        level.append(key)
 
                     if not level:
                         continue
 
                     results = await asyncio.gather(
-                        *(self._crawl_single_url(client, url) for url in level)
+                        *(self._crawl_single_url(client, url) for url in level),
+                        return_exceptions=True,
                     )
 
-                    for result in results:
+                    for url, result in zip(level, results, strict=True):
+                        if isinstance(result, BaseException):
+                            logger.exception("Failed crawling %s: %s", url, result)
+                            continue
                         if result is None:
                             continue
+
+                        raw_final = result.page.url or url
+                        final_key = normalize_url(raw_final, prefer_www=self.prefer_www)
+                        visited.add(final_key)
+                        if final_key in stored_urls:
+                            continue
+                        if len(stored_urls) >= self.max_pages:
+                            break
+
+                        result.page.raw_url = raw_final
+                        result.page.url = final_key
+                        stored_urls.add(final_key)
                         await self.storage.add(crawl_run_id, result.page)
                         if self.progress_callback is not None:
                             self.progress_callback()
@@ -124,9 +168,12 @@ class CrawlerService:
                             continue
 
                         for discovered_url in result.discovered_urls:
-                            if discovered_url in visited:
+                            discovered_key = normalize_url(
+                                discovered_url, prefer_www=self.prefer_www
+                            )
+                            if discovered_key in visited:
                                 continue
-                            queue.append((discovered_url, current_depth + 1))
+                            queue.append((discovered_key, current_depth + 1))
 
                 await self.storage.flush()
             except Exception:
@@ -135,7 +182,10 @@ class CrawlerService:
                 raise
             finally:
                 flush_stop.set()
-                await flush_task
+                try:
+                    await flush_task
+                except Exception:
+                    logger.exception("Periodic flush task ended with an error")
                 await self._close_playwright()
 
     async def _crawl_single_url(self, client: httpx.AsyncClient, url: str) -> CrawlResult | None:
@@ -149,13 +199,20 @@ class CrawlerService:
 
             final_page = raw_page
             if self._should_render_js(raw_page):
-                rendered_page = await self._fetch_with_playwright(url)
+                rendered_page = await self._fetch_with_playwright(client, url)
                 if rendered_page is not None:
                     rendered_page.js_rendered = True
                     rendered_page.rendered_diff_significant = rendered_content_differs(
                         raw_page, rendered_page
                     )
+                    # Preserve redirect chain measured on the primary HTTP fetch.
+                    if not rendered_page.redirect_chain and raw_page.redirect_chain:
+                        rendered_page.redirect_chain = list(raw_page.redirect_chain)
+                        rendered_page.redirect_hops = raw_page.redirect_hops
                     final_page = rendered_page
+
+            if final_page.html is not None:
+                await self._enrich_page_signals(client, final_page)
 
             discovered_urls = [
                 link.target_url for link in final_page.links if link.is_internal
@@ -188,6 +245,7 @@ class CrawlerService:
             )
 
         elapsed_ms = (time.perf_counter() - started) * 1000
+        redirect_chain = _redirect_chain_from_response(response)
         content_type = response.headers.get("content-type", "").lower()
         if "html" not in content_type:
             return ExtractedPage(
@@ -200,18 +258,27 @@ class CrawlerService:
                 meta_description=None,
                 canonical_url=None,
                 meta_robots=None,
+                redirect_chain=redirect_chain,
+                html_bytes=_response_size_bytes(response),
             )
 
+        html_text = response.text
         return extract_page_data(
             url=str(response.url),
-            html=response.text,
+            html=html_text,
             status_code=response.status_code,
             response_time_ms=elapsed_ms,
             root_host=self.root_host,
             redirect_hops=len(response.history),
+            html_bytes=_response_size_bytes(response) or len(html_text.encode("utf-8", errors="replace")),
+            redirect_chain=redirect_chain,
         )
 
-    async def _fetch_with_playwright(self, url: str) -> ExtractedPage | None:
+    async def _fetch_with_playwright(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> ExtractedPage | None:
         browser = await self._ensure_browser()
         if browser is None:
             return None
@@ -229,11 +296,89 @@ class CrawlerService:
                 response_time_ms=elapsed_ms,
                 root_host=self.root_host,
                 redirect_hops=0,
+                html_bytes=len(html.encode("utf-8", errors="replace")),
             )
         except PlaywrightError:
             return None
         finally:
             await page.close()
+
+    async def _enrich_page_signals(self, client: httpx.AsyncClient, page: ExtractedPage) -> None:
+        if page.favicon_in_html:
+            page.favicon_present = True
+        else:
+            page.favicon_present = await self._probe_default_favicon(client, page.url)
+
+        page.resource_request_count = self._count_resource_requests(page)
+        page.total_page_weight_bytes = await self._estimate_page_weight(client, page)
+
+    def _count_resource_requests(self, page: ExtractedPage) -> int:
+        """Approximate subresource count: HTML document + unique CSS/JS/images."""
+        seen: set[str] = set()
+        count = 1  # HTML document itself
+        for url in [*page.stylesheet_urls, *page.script_urls, *(img.src for img in page.images)]:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            count += 1
+        return count
+
+    async def _probe_default_favicon(self, client: httpx.AsyncClient, page_url: str) -> bool:
+        parsed = urlparse(page_url)
+        favicon_url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+        try:
+            response = await client.head(favicon_url)
+            if response.status_code < 400:
+                return True
+            # Some servers disallow HEAD; fall back to GET.
+            if response.status_code in {405, 501}:
+                response = await client.get(favicon_url)
+                return response.status_code < 400
+            return False
+        except httpx.HTTPError:
+            return False
+
+    async def _estimate_page_weight(self, client: httpx.AsyncClient, page: ExtractedPage) -> int:
+        total = page.html_bytes or 0
+        resource_urls: list[str] = []
+        seen: set[str] = set()
+
+        for url in [*page.stylesheet_urls, *page.script_urls, *(img.src for img in page.images)]:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            resource_urls.append(url)
+            if len(resource_urls) >= _MAX_WEIGHT_RESOURCES:
+                break
+
+        if not resource_urls:
+            return total
+
+        sizes = await asyncio.gather(
+            *(self._resource_size_bytes(client, url) for url in resource_urls)
+        )
+        size_by_url = {url: size for url, size in zip(resource_urls, sizes, strict=True)}
+        for image in page.images:
+            if image.src in size_by_url:
+                image.size_bytes = size_by_url[image.src] or None
+        return total + sum(sizes)
+
+    async def _resource_size_bytes(self, client: httpx.AsyncClient, url: str) -> int:
+        try:
+            response = await client.head(url)
+            if response.status_code in {405, 501}:
+                response = await client.get(url)
+            if response.status_code >= 400:
+                return 0
+            size = _response_size_bytes(response)
+            if size is not None:
+                return size
+            # HEAD without Content-Length — skip body download to stay lightweight.
+            if response.request.method.upper() == "HEAD":
+                return 0
+            return len(response.content)
+        except httpx.HTTPError:
+            return 0
 
     async def _ensure_browser(self) -> Browser | None:
         if self._browser is not None:
@@ -248,8 +393,6 @@ class CrawlerService:
             self._browser = await self._playwright.chromium.launch(headless=True)
             return self._browser
         except Exception as exc:
-            # Playwright is optional. On Windows under uvicorn's default event loop
-            # it can fail with NotImplementedError; continue with httpx-only crawls.
             logger.warning("Playwright unavailable, continuing with HTML crawl only: %s", exc)
             self._playwright_failed = True
             self._browser = None
@@ -295,7 +438,11 @@ class CrawlerService:
             crawl_delay = 0.0
             parser = self._robots_cache.get(host)
             if parser is not None:
-                crawl_delay = parser.crawl_delay(self.user_agent) or 0.0
+                raw_delay = parser.crawl_delay(self.user_agent)
+                try:
+                    crawl_delay = float(raw_delay) if raw_delay is not None else 0.0
+                except (TypeError, ValueError):
+                    crawl_delay = 0.0
             effective_delay = max(self.request_delay, crawl_delay)
             if last_request_at is not None:
                 wait_time = effective_delay - (now - last_request_at)
@@ -318,4 +465,29 @@ class CrawlerService:
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.flush_interval)
             except asyncio.TimeoutError:
-                await self.storage.flush()
+                try:
+                    await self.storage.flush()
+                except Exception:
+                    logger.exception("Periodic crawl flush failed")
+
+
+def _redirect_chain_from_response(response: httpx.Response) -> list[RedirectHop]:
+    hops: list[RedirectHop] = []
+    for prior in response.history:
+        hops.append(RedirectHop(url=str(prior.url), status_code=prior.status_code))
+    return hops
+
+
+def _response_size_bytes(response: httpx.Response) -> int | None:
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            return max(0, int(content_length))
+        except ValueError:
+            pass
+    # For responses where the body was already read.
+    try:
+        content = response.content
+    except Exception:
+        return None
+    return len(content)

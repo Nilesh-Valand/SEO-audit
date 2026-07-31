@@ -1,25 +1,67 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urldefrag, urlparse
+from urllib.parse import parse_qs, urldefrag, urlparse
 
 import yaml
 from bs4 import BeautifulSoup
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, joinedload
 
+from app.rules.schema_validation import validate_schema_blocks
+from app.crawler.normalize import normalize_url
 from app.db.database import SessionLocal
-from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore, PageLink, PageVital, SitemapFinding
+from app.models import (
+    AuditIssue,
+    CrawledPage,
+    CrawlRun,
+    CrawlRunScore,
+    PageLink,
+    PageTechnicalDetails,
+    PageVital,
+    SitemapFinding,
+)
 
 SEVERITY_WEIGHTS = {
     "critical": 10,
     "high": 5,
     "medium": 2,
     "low": 1,
+}
+
+EXCESSIVE_URL_LENGTH = 115
+LARGE_PAGE_WEIGHT_BYTES = 3 * 1024 * 1024
+EXCESSIVE_RESOURCE_REQUESTS = 100
+MAX_BLOCKING_STYLESHEETS = 2
+OVERSIZED_IMAGE_BYTES = 200 * 1024
+SLOW_TTFB_MS = 800
+OUTDATED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
+KEYWORD_CANNIBALIZATION_THRESHOLD = 0.8
+LONG_FORM_WORD_COUNT = 800
+ANSWER_FIRST_MIN_WORDS = 20
+
+TRACKING_QUERY_PARAMS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_id",
+    "gclid",
+    "fbclid",
+    "msclkid",
+    "sid",
+    "sessionid",
+    "session_id",
+    "phpsessid",
+    "_ga",
+    "mc_cid",
+    "mc_eid",
 }
 
 
@@ -49,9 +91,12 @@ class PageContext:
     normalized_url: str
     inbound_internal_links: int
     h1_count: int
+    h2_count: int
+    h3_count: int
     text_hash: str | None
     has_mixed_content: bool
     vitals: dict[str, PageVital]
+    technical: PageTechnicalDetails | None = None
 
 
 class RuleEngine:
@@ -72,13 +117,43 @@ class RuleEngine:
             "lcp_fail": self._lcp_fail,
             "inp_fail": self._inp_fail,
             "cls_fail": self._cls_fail,
+            "large_page_weight": self._large_page_weight,
+            "excessive_requests": self._excessive_requests,
+            "render_blocking_resources": self._render_blocking_resources,
+            "oversized_images": self._oversized_images,
+            "missing_image_dimensions": self._missing_image_dimensions,
+            "outdated_image_format": self._outdated_image_format,
+            "slow_ttfb": self._slow_ttfb,
             "thin_content": self._thin_content,
             "duplicate_content": self._duplicate_content,
             "missing_schema": self._missing_schema,
             "mixed_content": self._mixed_content,
             "sitemap_orphan": self._sitemap_orphan,
             "crawled_not_in_sitemap": self._crawled_not_in_sitemap,
+            "uppercase_url": self._uppercase_url,
+            "underscore_in_url": self._underscore_in_url,
+            "excessive_url_length": self._excessive_url_length,
+            "unnecessary_url_parameters": self._unnecessary_url_parameters,
+            "redirect_loop": self._redirect_loop,
+            "temp_redirect_should_be_permanent": self._temp_redirect_should_be_permanent,
+            "robots_txt_syntax_error": self._robots_txt_syntax_error,
+            "robots_txt_missing": self._robots_txt_missing,
+            "ai_crawler_blocked": self._ai_crawler_blocked,
+            "llms_txt_missing": self._llms_txt_missing,
+            "answer_first_heuristic": self._answer_first_heuristic,
+            "sitemap_not_found": self._sitemap_not_found,
+            "sitemap_malformed": self._sitemap_malformed,
+            "sitemap_child_broken": self._sitemap_child_broken,
+            "missing_og_tags": self._missing_og_tags,
+            "missing_twitter_card": self._missing_twitter_card,
+            "missing_html_lang": self._missing_html_lang,
+            "missing_favicon": self._missing_favicon,
+            "generic_404_page": self._generic_404_page,
+            "schema_invalid": self._schema_invalid,
+            "keyword_cannibalization": self._keyword_cannibalization,
+            "poor_content_structure": self._poor_content_structure,
         }
+        self._current_crawl_run: CrawlRun | None = None
 
     def run(self, crawl_run_id: int) -> dict[str, int]:
         with SessionLocal() as db:
@@ -88,6 +163,7 @@ class RuleEngine:
             if crawl_run.status not in {"completed", "enriching", "running"}:
                 raise ValueError("Rule engine can only run after the crawl has finished fetching pages.")
 
+            self._purge_duplicate_pages(db, crawl_run_id)
             page_contexts = self._load_page_contexts(db, crawl_run_id)
             findings = db.scalars(
                 select(SitemapFinding).where(SitemapFinding.crawl_run_id == crawl_run_id)
@@ -96,12 +172,16 @@ class RuleEngine:
             db.execute(delete(AuditIssue).where(AuditIssue.crawl_run_id == crawl_run_id))
             db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_run_id == crawl_run_id))
 
+            self._current_crawl_run = crawl_run
             issues: list[IssueRecord] = []
-            for rule in self.rules:
-                check = self._checks.get(rule.condition)
-                if check is None:
-                    continue
-                issues.extend(check(rule, crawl_run_id, page_contexts, findings))
+            try:
+                for rule in self.rules:
+                    check = self._checks.get(rule.condition)
+                    if check is None:
+                        continue
+                    issues.extend(check(rule, crawl_run_id, page_contexts, findings))
+            finally:
+                self._current_crawl_run = None
 
             for issue in issues:
                 db.add(
@@ -133,15 +213,66 @@ class RuleEngine:
         payload = yaml.safe_load(self.rules_path.read_text(encoding="utf-8")) or []
         return [RuleDefinition(**item) for item in payload]
 
+    def _purge_duplicate_pages(self, db: Session, crawl_run_id: int) -> int:
+        """Remove extra crawled_page rows that share the same canonical URL."""
+        pages = db.scalars(
+            select(CrawledPage)
+            .where(CrawledPage.crawl_run_id == crawl_run_id)
+            .order_by(CrawledPage.id.asc())
+        ).all()
+
+        keep_count = 0
+        delete_ids: list[int] = []
+        seen: set[str] = set()
+        for page in pages:
+            key = self._normalize_url(page.url)
+            if page.url != key:
+                page.url = key
+            if key in seen:
+                delete_ids.append(page.id)
+                continue
+            seen.add(key)
+            keep_count += 1
+
+        if delete_ids:
+            db.execute(delete(PageLink).where(PageLink.crawled_page_id.in_(delete_ids)))
+            db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(delete_ids)))
+            db.execute(
+                delete(PageTechnicalDetails).where(
+                    PageTechnicalDetails.crawled_page_id.in_(delete_ids)
+                )
+            )
+            db.execute(delete(AuditIssue).where(AuditIssue.crawled_page_id.in_(delete_ids)))
+            db.execute(delete(CrawledPage).where(CrawledPage.id.in_(delete_ids)))
+
+        crawl_run = db.get(CrawlRun, crawl_run_id)
+        if crawl_run is not None:
+            crawl_run.total_urls = keep_count
+        db.flush()
+        return len(delete_ids)
+
     def _load_page_contexts(self, db: Session, crawl_run_id: int) -> list[PageContext]:
         pages = db.scalars(
             select(CrawledPage)
             .where(CrawledPage.crawl_run_id == crawl_run_id)
-            .options(joinedload(CrawledPage.page_vitals))
+            .options(
+                joinedload(CrawledPage.page_vitals),
+                joinedload(CrawledPage.technical_details),
+            )
             .order_by(CrawledPage.id.asc())
         ).unique().all()
 
-        normalized_to_page = {self._normalize_url(page.url): page for page in pages}
+        # Defense in depth: still collapse by canonical URL if any duplicates remain.
+        deduped_pages: list[CrawledPage] = []
+        seen_urls: set[str] = set()
+        for page in pages:
+            key = self._normalize_url(page.url)
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            deduped_pages.append(page)
+
+        normalized_to_page = {self._normalize_url(page.url): page for page in deduped_pages}
         inbound_links = defaultdict(int)
         links = db.scalars(
             select(PageLink).join(CrawledPage).where(CrawledPage.crawl_run_id == crawl_run_id)
@@ -154,9 +285,11 @@ class RuleEngine:
                 inbound_links[target] += 1
 
         contexts: list[PageContext] = []
-        for page in pages:
+        for page in deduped_pages:
             normalized_url = self._normalize_url(page.url)
-            h1_count, text_hash, mixed_content = self._snapshot_signals(page.raw_html_path, page.url)
+            h1_count, h2_count, h3_count, text_hash, mixed_content = self._snapshot_signals(
+                page.raw_html_path, page.url
+            )
             vitals = {vital.strategy: vital for vital in page.page_vitals}
             contexts.append(
                 PageContext(
@@ -164,26 +297,33 @@ class RuleEngine:
                     normalized_url=normalized_url,
                     inbound_internal_links=inbound_links.get(normalized_url, 0),
                     h1_count=h1_count,
+                    h2_count=h2_count,
+                    h3_count=h3_count,
                     text_hash=text_hash,
                     has_mixed_content=mixed_content,
                     vitals=vitals,
+                    technical=page.technical_details,
                 )
             )
         return contexts
 
-    def _snapshot_signals(self, raw_html_path: str | None, page_url: str) -> tuple[int, str | None, bool]:
+    def _snapshot_signals(
+        self, raw_html_path: str | None, page_url: str
+    ) -> tuple[int, int, int, str | None, bool]:
         if not raw_html_path:
-            return 0, None, False
+            return 0, 0, 0, None, False
         path = Path(raw_html_path)
         if not path.exists():
-            return 0, None, False
+            return 0, 0, 0, None, False
 
         html = path.read_text(encoding="utf-8")
         soup = BeautifulSoup(html, "lxml")
         h1_count = len(soup.find_all("h1"))
+        h2_count = len(soup.find_all("h2"))
+        h3_count = len(soup.find_all("h3"))
         text_hash = self._content_hash(soup)
         mixed_content = self._has_mixed_content(soup, page_url)
-        return h1_count, text_hash, mixed_content
+        return h1_count, h2_count, h3_count, text_hash, mixed_content
 
     def _compute_scores(
         self,
@@ -319,6 +459,182 @@ class RuleEngine:
     def _cls_fail(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
         return self._vital_issues(rule, crawl_run_id, pages, "cls", 0.1, "CLS is {value:.2f}.")
 
+    def _large_page_weight(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            weight = page.technical.total_page_weight_bytes if page.technical else None
+            if weight is None or weight <= LARGE_PAGE_WEIGHT_BYTES:
+                continue
+            mb = weight / (1024 * 1024)
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Measured page weight is {mb:.2f}MB (threshold {LARGE_PAGE_WEIGHT_BYTES / (1024 * 1024):.0f}MB).",
+                )
+            )
+        return issues
+
+    def _excessive_requests(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            count = page.technical.resource_request_count if page.technical else None
+            if count is None or count <= EXCESSIVE_RESOURCE_REQUESTS:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Page references about {count} resources (threshold {EXCESSIVE_RESOURCE_REQUESTS}).",
+                )
+            )
+        return issues
+
+    def _render_blocking_resources(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            if tech is None:
+                continue
+            blocking_scripts = tech.render_blocking_scripts_in_head or 0
+            stylesheets = tech.stylesheets_in_head or 0
+            if blocking_scripts <= 0 and stylesheets <= MAX_BLOCKING_STYLESHEETS:
+                continue
+            parts: list[str] = []
+            if blocking_scripts > 0:
+                parts.append(
+                    f"{blocking_scripts} render-blocking script(s) in <head> without async/defer"
+                )
+            if stylesheets > MAX_BLOCKING_STYLESHEETS:
+                parts.append(
+                    f"{stylesheets} stylesheet(s) in <head> (threshold {MAX_BLOCKING_STYLESHEETS})"
+                )
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "; ".join(parts) + ".",
+                )
+            )
+        return issues
+
+    def _oversized_images(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            oversized = []
+            for image in self._iter_images(page):
+                size = image.get("size_bytes")
+                if not isinstance(size, int) or size <= OVERSIZED_IMAGE_BYTES:
+                    continue
+                width = image.get("width")
+                height = image.get("height")
+                dims = (
+                    f" at declared {width}x{height}"
+                    if isinstance(width, int) and isinstance(height, int)
+                    else ""
+                )
+                src = str(image.get("src") or "image")
+                oversized.append(f"{src} ({size / 1024:.0f}KB{dims})")
+            if not oversized:
+                continue
+            sample = "; ".join(oversized[:3])
+            extra = f" (+{len(oversized) - 3} more)" if len(oversized) > 3 else ""
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"{len(oversized)} image(s) exceed {OVERSIZED_IMAGE_BYTES // 1024}KB"
+                    f" (consider resizing/compression): {sample}{extra}.",
+                )
+            )
+        return issues
+
+    def _missing_image_dimensions(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            missing = [
+                str(image.get("src") or "image")
+                for image in self._iter_images(page)
+                if not image.get("has_width") or not image.get("has_height")
+            ]
+            if not missing:
+                continue
+            sample = ", ".join(missing[:3])
+            extra = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"{len(missing)} <img> tag(s) missing width and/or height attributes "
+                    f"(can cause layout shift): {sample}{extra}.",
+                )
+            )
+        return issues
+
+    def _outdated_image_format(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            outdated = [
+                f"{image.get('src')} (.{image.get('file_extension')})"
+                for image in self._iter_images(page)
+                if str(image.get("file_extension") or "").lower() in OUTDATED_IMAGE_EXTENSIONS
+            ]
+            if not outdated:
+                continue
+            sample = ", ".join(outdated[:3])
+            extra = f" (+{len(outdated) - 3} more)" if len(outdated) > 3 else ""
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"{len(outdated)} image(s) use jpg/png; consider WebP/AVIF where supported: "
+                    f"{sample}{extra}.",
+                )
+            )
+        return issues
+
+    def _slow_ttfb(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            response_ms = page.page.response_time_ms
+            if response_ms is None or response_ms <= SLOW_TTFB_MS:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Response time was {response_ms:.0f}ms (threshold {SLOW_TTFB_MS}ms).",
+                )
+            )
+        return issues
+
+    def _iter_images(self, page: PageContext) -> list[dict[str, Any]]:
+        tech = page.technical
+        if tech is None or not isinstance(tech.images_json, list):
+            return []
+        return [image for image in tech.images_json if isinstance(image, dict)]
+
     def _thin_content(self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]) -> list[IssueRecord]:
         return [
             self._page_issue(
@@ -338,15 +654,16 @@ class RuleEngine:
                 groups[page.text_hash].append(page)
         issues: list[IssueRecord] = []
         for group in groups.values():
-            if len(group) < 2:
+            unique_pages = self._unique_pages_by_url(group)
+            if len(unique_pages) < 2:
                 continue
-            for page in group:
+            for page in unique_pages:
                 issues.append(
                     self._page_issue(
                         rule,
                         crawl_run_id,
                         page,
-                        f"Page content hash matches {len(group)} pages in this crawl.",
+                        f"Page content hash matches {len(unique_pages)} pages in this crawl.",
                     )
                 )
         return issues
@@ -395,7 +712,8 @@ class RuleEngine:
                 rule_id=rule.id,
                 category=rule.category,
                 severity=rule.severity,
-                message="URL is present in the sitemap but was not crawled in this run.",
+                message=finding.message
+                or "Sitemap URLs were not covered by this crawl. Increase max pages for broader coverage.",
             )
             for finding in findings
             if finding.finding_type == "in_sitemap_not_crawled"
@@ -420,6 +738,599 @@ class RuleEngine:
             )
         return issues
 
+    def _uppercase_url(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            has_upper = tech.url_has_uppercase if tech is not None else self._url_has_uppercase(page.page.url)
+            if has_upper:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        "URL contains uppercase characters, which can cause duplicate-content and crawl inconsistencies.",
+                    )
+                )
+        return issues
+
+    def _underscore_in_url(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            has_underscore = (
+                tech.url_has_underscore if tech is not None else ("_" in urlparse(page.page.url).path)
+            )
+            if has_underscore:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        "URL path uses underscores; hyphens are preferred for readability and SEO.",
+                    )
+                )
+        return issues
+
+    def _excessive_url_length(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            length = tech.url_length if tech is not None else len(page.page.url)
+            if length > EXCESSIVE_URL_LENGTH:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        f"URL is {length} characters long (threshold {EXCESSIVE_URL_LENGTH}).",
+                    )
+                )
+        return issues
+
+    def _unnecessary_url_parameters(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            if not page.page.is_indexable:
+                continue
+            if page.page.status_code is not None and page.page.status_code >= 400:
+                continue
+            params = self._tracking_params_present(page.page.url)
+            if not params:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "Indexable page URL includes tracking/session parameters: "
+                    + ", ".join(sorted(params))
+                    + ".",
+                )
+            )
+        return issues
+
+    def _redirect_loop(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            chain_urls = self._redirect_chain_urls(page)
+            if len(chain_urls) < 2:
+                continue
+            seen: set[str] = set()
+            looped = False
+            for url in chain_urls:
+                normalized = self._normalize_url(url)
+                if normalized in seen:
+                    looped = True
+                    break
+                seen.add(normalized)
+            if looped:
+                issues.append(
+                    self._page_issue(
+                        rule,
+                        crawl_run_id,
+                        page,
+                        "Redirect chain contains a loop (a URL redirects back to a previously seen URL).",
+                    )
+                )
+        return issues
+
+    def _temp_redirect_should_be_permanent(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        pair_pages: dict[tuple[str, str], list[PageContext]] = defaultdict(list)
+        page_pairs: dict[int, set[tuple[str, str]]] = defaultdict(set)
+
+        for page in pages:
+            for source, destination, status in self._redirect_hop_pairs(page):
+                if status != 302:
+                    continue
+                pair = (self._normalize_url(source), self._normalize_url(destination))
+                if pair[0] == pair[1]:
+                    continue
+                pair_pages[pair].append(page)
+                page_pairs[page.page.id].add(pair)
+
+        consistent_pairs = {pair for pair, group in pair_pages.items() if len({p.page.id for p in group}) >= 2}
+        if not consistent_pairs:
+            return []
+
+        issues: list[IssueRecord] = []
+        for page in pages:
+            matching = page_pairs[page.page.id] & consistent_pairs
+            if not matching:
+                continue
+            examples = ", ".join(f"{src} → {dst}" for src, dst in sorted(matching)[:3])
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "Temporary (302) redirect pair(s) appear consistently across the crawl and "
+                    f"likely should be permanent (301): {examples}.",
+                )
+            )
+        return issues
+
+    def _robots_txt_syntax_error(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        crawl_run = self._current_crawl_run
+        if crawl_run is None or not crawl_run.robots_txt_found:
+            return []
+        if crawl_run.robots_txt_valid is not False:
+            return []
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url="/robots.txt",
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message="robots.txt was found but appears to have syntax problems.",
+            )
+        ]
+
+    def _robots_txt_missing(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        crawl_run = self._current_crawl_run
+        if crawl_run is None or crawl_run.robots_txt_found is not False:
+            return []
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url="/robots.txt",
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message=(
+                    "No robots.txt was found at the site root. This may be intentional, "
+                    "but crawlers then fall back to default allow behavior."
+                ),
+            )
+        ]
+
+    def _ai_crawler_blocked(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        crawl_run = self._current_crawl_run
+        if crawl_run is None:
+            return []
+        blocked = crawl_run.robots_txt_ai_disallowed or []
+        if not isinstance(blocked, list) or not blocked:
+            return []
+        agents = ", ".join(str(agent) for agent in blocked)
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url="/robots.txt",
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message=(
+                    f"AI crawler user-agent(s) are disallowed in robots.txt: {agents}. "
+                    "This may be an intentional policy choice."
+                ),
+            )
+        ]
+
+    def _llms_txt_missing(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        crawl_run = self._current_crawl_run
+        if crawl_run is None or crawl_run.llms_txt_present is not False:
+            return []
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url="/llms.txt",
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message=(
+                    "No llms.txt was found at the site root. This is an emerging convention "
+                    "for AI assistants (not a hard requirement)."
+                ),
+            )
+        ]
+
+    def _answer_first_heuristic(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            if not page.page.is_indexable:
+                continue
+            if page.page.status_code is not None and page.page.status_code >= 400:
+                continue
+            result = self._first_answer_paragraph(page.page.raw_html_path)
+            if result is None:
+                continue
+            word_count, reason = result
+            if word_count >= ANSWER_FIRST_MIN_WORDS:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    (
+                        "Content may bury the answer: "
+                        f"{reason} (first meaningful paragraph has {word_count} words; "
+                        f"aim for {ANSWER_FIRST_MIN_WORDS}+ before the first H2)."
+                    ),
+                )
+            )
+        return issues
+
+    def _first_answer_paragraph(self, raw_html_path: str | None) -> tuple[int, str] | None:
+        """Return (word_count, reason) for the first post-H1 paragraph before H2, if evaluable."""
+        if not raw_html_path:
+            return None
+        path = Path(raw_html_path)
+        if not path.exists():
+            return None
+
+        soup = BeautifulSoup(path.read_text(encoding="utf-8"), "lxml")
+        body = soup.body or soup
+        h1 = body.find("h1")
+        if h1 is None:
+            return None
+
+        for element in h1.find_all_next(["p", "h2", "h3", "h4", "h5", "h6"]):
+            name = (element.name or "").lower()
+            if name in {"h2", "h3", "h4", "h5", "h6"}:
+                return 0, "no substantive paragraph found before the first subheading"
+            text = " ".join(element.get_text(" ", strip=True).split())
+            if self._looks_like_nav_crumb(element, text):
+                continue
+            words = text.split()
+            return len(words), "opening paragraph is very short or thin"
+
+        return 0, "no paragraph content found after the H1"
+
+    def _looks_like_nav_crumb(self, element: Any, text: str) -> bool:
+        if not text:
+            return True
+        classes = " ".join(element.get("class", []) if hasattr(element, "get") else []).lower()
+        parent = element.parent
+        parent_classes = ""
+        parent_id = ""
+        if parent is not None and hasattr(parent, "get"):
+            parent_classes = " ".join(parent.get("class", []) or []).lower()
+            parent_id = str(parent.get("id") or "").lower()
+        haystack = f"{classes} {parent_classes} {parent_id}"
+        if any(token in haystack for token in ("breadcrumb", "breadcrumbs", "crumb", "nav")):
+            return True
+        # Very link-heavy short lines often are crumbs.
+        links = element.find_all("a") if hasattr(element, "find_all") else []
+        if links and len(text.split()) <= 12 and len(links) >= max(1, len(text.split()) // 3):
+            return True
+        return False
+
+    def _sitemap_not_found(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], findings: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return self._sitemap_structure_issues(rule, crawl_run_id, findings, "sitemap_not_found")
+
+    def _sitemap_malformed(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], findings: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return self._sitemap_structure_issues(rule, crawl_run_id, findings, "sitemap_malformed")
+
+    def _sitemap_child_broken(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], findings: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return self._sitemap_structure_issues(rule, crawl_run_id, findings, "sitemap_child_broken")
+
+    def _missing_og_tags(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            if tech is None:
+                continue
+            missing = []
+            if not (tech.og_title or "").strip():
+                missing.append("og:title")
+            if not (tech.og_description or "").strip():
+                missing.append("og:description")
+            if not (tech.og_image or "").strip():
+                missing.append("og:image")
+            if not missing:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Missing Open Graph tag(s): {', '.join(missing)}.",
+                )
+            )
+        return issues
+
+    def _missing_twitter_card(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            if tech is None:
+                continue
+            if (tech.twitter_card or "").strip() and (tech.twitter_title or "").strip():
+                continue
+            missing = []
+            if not (tech.twitter_card or "").strip():
+                missing.append("twitter:card")
+            if not (tech.twitter_title or "").strip():
+                missing.append("twitter:title")
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    f"Missing Twitter card tag(s): {', '.join(missing)}.",
+                )
+            )
+        return issues
+
+    def _missing_html_lang(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return [
+            self._page_issue(
+                rule,
+                crawl_run_id,
+                page,
+                "The <html> tag is missing a lang attribute.",
+            )
+            for page in pages
+            if page.technical is not None and not (page.technical.html_lang or "").strip()
+        ]
+
+    def _missing_favicon(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return [
+            self._page_issue(
+                rule,
+                crawl_run_id,
+                page,
+                "No favicon was detected (link rel=icon or /favicon.ico).",
+            )
+            for page in pages
+            if page.technical is not None and not page.technical.favicon_present
+        ]
+
+    def _generic_404_page(
+        self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        crawl_run = self._current_crawl_run
+        if crawl_run is None or crawl_run.soft_404_is_soft is not True:
+            return []
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url=crawl_run.soft_404_probe_url,
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message=crawl_run.soft_404_detail
+                or "Unknown URLs do not return a proper custom 404 page.",
+            )
+        ]
+
+    def _schema_invalid(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in pages:
+            tech = page.technical
+            if tech is None or not isinstance(tech.schema_json, list) or not tech.schema_json:
+                continue
+            problems = validate_schema_blocks(tech.schema_json)
+            if not problems:
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    " ".join(problems[:3])
+                    + (f" (+{len(problems) - 3} more)." if len(problems) > 3 else ""),
+                )
+            )
+        return issues
+
+    def _keyword_cannibalization(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        candidates = [
+            page
+            for page in pages
+            if page.page.is_indexable
+            and (page.page.status_code is None or page.page.status_code < 400)
+            and ((page.page.title or "").strip() or (page.page.h1 or "").strip())
+        ]
+        flagged: dict[int, set[str]] = defaultdict(set)
+        for index, left in enumerate(candidates):
+            left_tokens = self._intent_tokens(left.page.title, left.page.h1)
+            if len(left_tokens) < 2:
+                continue
+            for right in candidates[index + 1 :]:
+                right_tokens = self._intent_tokens(right.page.title, right.page.h1)
+                if len(right_tokens) < 2:
+                    continue
+                overlap = self._token_overlap(left_tokens, right_tokens)
+                if overlap < KEYWORD_CANNIBALIZATION_THRESHOLD:
+                    continue
+                flagged[left.page.id].add(right.page.url)
+                flagged[right.page.id].add(left.page.url)
+
+        issues: list[IssueRecord] = []
+        by_id = {page.page.id: page for page in candidates}
+        for page_id, rivals in flagged.items():
+            page = by_id[page_id]
+            sample = ", ".join(sorted(rivals)[:3])
+            extra = f" (+{len(rivals) - 3} more)" if len(rivals) > 3 else ""
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "Title/H1 text is highly similar to other page(s) and may cannibalize "
+                    f"the same search intent: {sample}{extra}.",
+                )
+            )
+        return issues
+
+    def _poor_content_structure(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        return [
+            self._page_issue(
+                rule,
+                crawl_run_id,
+                page,
+                f"Long-form page ({page.page.word_count} words) has no H2/H3 subheadings.",
+            )
+            for page in pages
+            if (page.page.word_count or 0) > LONG_FORM_WORD_COUNT
+            and page.h2_count == 0
+            and page.h3_count == 0
+        ]
+
+    def _intent_tokens(self, title: str | None, h1: str | None) -> set[str]:
+        text = f"{title or ''} {h1 or ''}".lower()
+        tokens = {token for token in re.findall(r"[a-z0-9]{3,}", text)}
+        stop = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "your",
+            "our",
+            "this",
+            "that",
+            "page",
+            "home",
+            "best",
+            "guide",
+        }
+        return {token for token in tokens if token not in stop}
+
+    def _token_overlap(self, left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        intersection = len(left & right)
+        union = len(left | right)
+        return intersection / union if union else 0.0
+
+    def _sitemap_structure_issues(
+        self,
+        rule: RuleDefinition,
+        crawl_run_id: int,
+        findings: list[SitemapFinding],
+        finding_type: str,
+    ) -> list[IssueRecord]:
+        return [
+            IssueRecord(
+                crawl_run_id=crawl_run_id,
+                crawled_page_id=None,
+                target_url=finding.url,
+                rule_id=rule.id,
+                category=rule.category,
+                severity=rule.severity,
+                message=finding.message or f"Sitemap issue: {finding_type}.",
+            )
+            for finding in findings
+            if finding.finding_type == finding_type
+        ]
+
+    def _tracking_params_present(self, url: str) -> set[str]:
+        query = parse_qs(urlparse(url).query, keep_blank_values=True)
+        found: set[str] = set()
+        for key in query:
+            lowered = key.lower()
+            if lowered in TRACKING_QUERY_PARAMS or lowered.startswith("utm_"):
+                found.add(lowered)
+        return found
+
+    def _url_has_uppercase(self, url: str) -> bool:
+        parsed = urlparse(url)
+        path_and_query = f"{parsed.path or ''}{('?' + parsed.query) if parsed.query else ''}"
+        return any(ch.isupper() for ch in path_and_query)
+
+    def _redirect_chain_urls(self, page: PageContext) -> list[str]:
+        urls: list[str] = []
+        tech = page.technical
+        if tech and isinstance(tech.redirect_chain_json, list):
+            for hop in tech.redirect_chain_json:
+                if isinstance(hop, dict) and hop.get("url"):
+                    urls.append(str(hop["url"]))
+        urls.append(page.page.url)
+        return urls
+
+    def _redirect_hop_pairs(self, page: PageContext) -> list[tuple[str, str, int | None]]:
+        """Return (source_url, destination_url, status_code) for each redirect hop."""
+        tech = page.technical
+        hops: list[dict[str, Any]] = []
+        if tech and isinstance(tech.redirect_chain_json, list):
+            hops = [hop for hop in tech.redirect_chain_json if isinstance(hop, dict) and hop.get("url")]
+
+        if not hops:
+            return []
+
+        pairs: list[tuple[str, str, int | None]] = []
+        for index, hop in enumerate(hops):
+            source = str(hop["url"])
+            status = hop.get("status_code")
+            status_code = int(status) if isinstance(status, int) else None
+            if index + 1 < len(hops):
+                destination = str(hops[index + 1]["url"])
+            else:
+                destination = page.page.url
+            pairs.append((source, destination, status_code))
+        return pairs
+
     def _duplicate_text_issues(
         self,
         rule: RuleDefinition,
@@ -436,18 +1347,30 @@ class RuleEngine:
 
         issues: list[IssueRecord] = []
         for group in groups.values():
-            if len(group) < 2:
+            unique_pages = self._unique_pages_by_url(group)
+            if len(unique_pages) < 2:
                 continue
-            for page in group:
+            for page in unique_pages:
                 issues.append(
                     self._page_issue(
                         rule,
                         crawl_run_id,
                         page,
-                        template.format(count=len(group)),
+                        template.format(count=len(unique_pages)),
                     )
                 )
         return issues
+
+    def _unique_pages_by_url(self, pages: list[PageContext]) -> list[PageContext]:
+        unique: list[PageContext] = []
+        seen: set[str] = set()
+        for page in pages:
+            key = normalize_url(page.page.url)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(page)
+        return unique
 
     def _vital_issues(
         self,
@@ -458,6 +1381,7 @@ class RuleEngine:
         threshold: float,
         message_template: str,
     ) -> list[IssueRecord]:
+        # Skipped automatically when ENABLE_PAGESPEED is off / no vitals exist.
         issues: list[IssueRecord] = []
         for page in pages:
             candidates = [getattr(vital, field_name) for vital in page.vitals.values()]
@@ -486,7 +1410,7 @@ class RuleEngine:
         return IssueRecord(
             crawl_run_id=crawl_run_id,
             crawled_page_id=page.page.id,
-            target_url=page.page.url,
+            target_url=normalize_url(page.page.url),
             rule_id=rule.id,
             category=rule.category,
             severity=rule.severity,
@@ -511,12 +1435,4 @@ class RuleEngine:
         return False
 
     def _normalize_url(self, url: str) -> str:
-        normalized, _ = urldefrag(url)
-        parsed = urlparse(normalized)
-        path = parsed.path or "/"
-        return parsed._replace(
-            scheme=parsed.scheme.lower(),
-            netloc=parsed.netloc.lower(),
-            path=path.rstrip("/") or "/",
-            fragment="",
-        ).geturl()
+        return normalize_url(url)
