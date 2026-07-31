@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+@media print {
+  body {
+    background: white !important;
+  }
+
+  aside,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  main {
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  .report-print {
+    max-width: none !important;
+  }
+
+  .break-inside-avoid {
+    break-inside: avoid;
+  }
+}
+

@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text, Integer, Boolean, Float, ForeignKey
+from sqlalchemy import String, Text, Integer, Boolean, Float, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -6,10 +6,14 @@ from app.db.database import Base
 
 class CrawledPage(Base):
     __tablename__ = "crawled_pages"
+    __table_args__ = (
+        UniqueConstraint("crawl_run_id", "url", name="uq_crawled_pages_run_url"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     crawl_run_id: Mapped[int] = mapped_column(ForeignKey("crawl_runs.id"), nullable=False, index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     meta_description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -36,4 +40,9 @@ class CrawledPage(Base):
     )
     audit_issues: Mapped[list["AuditIssue"]] = relationship(  # noqa: F821
         back_populates="crawled_page", cascade="all, delete-orphan"
+    )
+    technical_details: Mapped["PageTechnicalDetails | None"] = relationship(  # noqa: F821
+        back_populates="crawled_page",
+        cascade="all, delete-orphan",
+        uselist=False,
     )

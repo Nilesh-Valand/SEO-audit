@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+
+from app.crawler.normalize import normalize_url
 
 WHITESPACE_RE = re.compile(r"\s+")
 
@@ -22,12 +25,24 @@ class ExtractedLink:
 class ExtractedImage:
     src: str
     alt: str | None
+    has_width: bool = False
+    has_height: bool = False
+    file_extension: str | None = None
+    width: int | None = None
+    height: int | None = None
+    size_bytes: int | None = None
 
 
 @dataclass(slots=True)
 class ExtractedSchemaBlock:
     raw: str
     parsed: Any | None
+
+
+@dataclass(slots=True)
+class RedirectHop:
+    url: str
+    status_code: int | None
 
 
 @dataclass(slots=True)
@@ -51,6 +66,29 @@ class ExtractedPage:
     js_rendered: bool = False
     rendered_diff_significant: bool = False
 
+    # --- Additive technical signals (Phase 3) ---
+    url_has_uppercase: bool = False
+    url_has_underscore: bool = False
+    url_length: int = 0
+    url_has_query_params: bool = False
+    og_title: str | None = None
+    og_description: str | None = None
+    og_image: str | None = None
+    twitter_card: str | None = None
+    twitter_title: str | None = None
+    html_lang: str | None = None
+    favicon_in_html: bool = False
+    favicon_present: bool | None = None
+    stylesheet_urls: list[str] = field(default_factory=list)
+    script_urls: list[str] = field(default_factory=list)
+    render_blocking_scripts_in_head: int = 0
+    stylesheets_in_head: int = 0
+    html_bytes: int | None = None
+    total_page_weight_bytes: int | None = None
+    resource_request_count: int | None = None
+    redirect_chain: list[RedirectHop] = field(default_factory=list)
+    raw_url: str | None = None
+
     @property
     def primary_h1(self) -> str | None:
         return (self.headings.get("h1") or [None])[0]
@@ -64,6 +102,8 @@ def extract_page_data(
     response_time_ms: float | None,
     root_host: str,
     redirect_hops: int = 0,
+    html_bytes: int | None = None,
+    redirect_chain: list[RedirectHop] | None = None,
 ) -> ExtractedPage:
     soup = BeautifulSoup(html, "lxml")
 
@@ -73,10 +113,18 @@ def extract_page_data(
     meta_robots = _get_meta_content(soup, "robots")
     headings = _extract_headings(soup)
     links = _extract_links(soup, url, root_host)
-    visible_text = _extract_visible_text(soup)
-    word_count = len(visible_text.split()) if visible_text else 0
     schema_blocks = _extract_schema_blocks(soup)
     images = _extract_images(soup, url)
+    url_signals = _extract_url_signals(url)
+    social = _extract_social_tags(soup, url)
+    html_lang = _extract_html_lang(soup)
+    favicon_in_html = _has_favicon_link(soup)
+    render_blocking = _extract_render_blocking(soup, url)
+    # Destructive: removes script/style nodes — run after other HTML parses.
+    visible_text = _extract_visible_text(soup)
+    word_count = len(visible_text.split()) if visible_text else 0
+
+    measured_html_bytes = html_bytes if html_bytes is not None else len(html.encode("utf-8", errors="replace"))
 
     return ExtractedPage(
         url=url,
@@ -95,6 +143,23 @@ def extract_page_data(
         has_schema=bool(schema_blocks),
         schema_blocks=schema_blocks,
         images=images,
+        url_has_uppercase=url_signals["has_uppercase"],
+        url_has_underscore=url_signals["has_underscore"],
+        url_length=url_signals["length"],
+        url_has_query_params=url_signals["has_query_params"],
+        og_title=social["og_title"],
+        og_description=social["og_description"],
+        og_image=social["og_image"],
+        twitter_card=social["twitter_card"],
+        twitter_title=social["twitter_title"],
+        html_lang=html_lang,
+        favicon_in_html=favicon_in_html,
+        stylesheet_urls=render_blocking["stylesheet_urls"],
+        script_urls=render_blocking["script_urls"],
+        render_blocking_scripts_in_head=render_blocking["render_blocking_scripts_in_head"],
+        stylesheets_in_head=render_blocking["stylesheets_in_head"],
+        html_bytes=measured_html_bytes,
+        redirect_chain=list(redirect_chain or []),
     )
 
 
@@ -112,6 +177,97 @@ def rendered_content_differs(raw_page: ExtractedPage, rendered_page: ExtractedPa
     title_changed = raw_title.strip() != rendered_title.strip()
 
     return delta >= 100 or relative_delta >= 0.5 or title_changed
+
+
+def _extract_url_signals(url: str) -> dict[str, Any]:
+    parsed = urlparse(url)
+    # Path + query (decoded for underscore/length checks; uppercase on raw path+query).
+    path_and_query = f"{parsed.path or ''}{('?' + parsed.query) if parsed.query else ''}"
+    raw_check = unquote(path_and_query)
+    return {
+        "has_uppercase": any(ch.isupper() for ch in path_and_query),
+        "has_underscore": "_" in raw_check,
+        "length": len(url),
+        "has_query_params": bool(parsed.query),
+    }
+
+
+def _extract_social_tags(soup: BeautifulSoup, page_url: str) -> dict[str, str | None]:
+    og_image_raw = _get_meta_property(soup, "og:image")
+    return {
+        "og_title": _get_meta_property(soup, "og:title"),
+        "og_description": _get_meta_property(soup, "og:description"),
+        "og_image": urljoin(page_url, og_image_raw) if og_image_raw else None,
+        "twitter_card": _get_meta_name_or_property(soup, "twitter:card"),
+        "twitter_title": _get_meta_name_or_property(soup, "twitter:title"),
+    }
+
+
+def _extract_html_lang(soup: BeautifulSoup) -> str | None:
+    html_tag = soup.find("html")
+    if html_tag is None:
+        return None
+    lang = html_tag.get("lang")
+    if isinstance(lang, list):
+        lang = lang[0] if lang else None
+    return _clean_text(lang)
+
+
+def _has_favicon_link(soup: BeautifulSoup) -> bool:
+    for tag in soup.find_all("link", href=True):
+        rel = tag.get("rel")
+        if not rel:
+            continue
+        rel_values = [str(item).lower() for item in (rel if isinstance(rel, list) else [rel])]
+        if any(value in {"icon", "shortcut icon", "apple-touch-icon"} for value in rel_values):
+            return True
+        if any("icon" in value for value in rel_values):
+            return True
+    return False
+
+
+def _extract_render_blocking(soup: BeautifulSoup, page_url: str) -> dict[str, Any]:
+    head = soup.head
+    stylesheet_urls: list[str] = []
+    script_urls: list[str] = []
+    seen_css: set[str] = set()
+    seen_js: set[str] = set()
+    stylesheets_in_head = 0
+    render_blocking_scripts = 0
+
+    for tag in soup.find_all("link", href=True):
+        rel = tag.get("rel")
+        rel_values = [str(item).lower() for item in (rel if isinstance(rel, list) else [rel or ""])]
+        if "stylesheet" not in rel_values:
+            continue
+        absolute = _normalize_link(page_url, tag.get("href"))
+        if absolute and absolute not in seen_css:
+            seen_css.add(absolute)
+            stylesheet_urls.append(absolute)
+        if head is not None and tag.find_parent("head") is head:
+            stylesheets_in_head += 1
+
+    for tag in soup.find_all("script", src=True):
+        absolute = _normalize_link(page_url, tag.get("src"))
+        if absolute and absolute not in seen_js:
+            seen_js.add(absolute)
+            script_urls.append(absolute)
+
+    if head is not None:
+        for tag in head.find_all("script", src=True):
+            if tag.has_attr("async") or tag.has_attr("defer"):
+                continue
+            script_type = (tag.get("type") or "").lower()
+            if script_type == "module":
+                continue
+            render_blocking_scripts += 1
+
+    return {
+        "stylesheet_urls": stylesheet_urls,
+        "script_urls": script_urls,
+        "render_blocking_scripts_in_head": render_blocking_scripts,
+        "stylesheets_in_head": stylesheets_in_head,
+    }
 
 
 def _extract_headings(soup: BeautifulSoup) -> dict[str, list[str]]:
@@ -175,13 +331,42 @@ def _extract_images(soup: BeautifulSoup, page_url: str) -> list[ExtractedImage]:
         src = tag.get("src")
         if not src:
             continue
+        absolute = urljoin(page_url, src)
+        width = _parse_int_attr(tag.get("width"))
+        height = _parse_int_attr(tag.get("height"))
         images.append(
             ExtractedImage(
-                src=urljoin(page_url, src),
+                src=absolute,
                 alt=_clean_text(tag.get("alt")),
+                has_width=tag.has_attr("width"),
+                has_height=tag.has_attr("height"),
+                file_extension=_file_extension(absolute),
+                width=width,
+                height=height,
             )
         )
     return images
+
+
+def _parse_int_attr(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    text = str(value).strip().lower().removesuffix("px")
+    try:
+        number = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _file_extension(url: str) -> str | None:
+    path = urlparse(url).path
+    suffix = PurePosixPath(unquote(path)).suffix.lower().lstrip(".")
+    return suffix or None
 
 
 def _extract_canonical(page_url: str, soup: BeautifulSoup) -> str | None:
@@ -195,6 +380,21 @@ def _get_meta_content(soup: BeautifulSoup, name: str) -> str | None:
     if tag is None:
         tag = soup.find("meta", attrs={"property": lambda value: value and value.lower() == name})
     return _clean_text(tag.get("content")) if tag else None
+
+
+def _get_meta_property(soup: BeautifulSoup, property_name: str) -> str | None:
+    tag = soup.find(
+        "meta",
+        attrs={"property": lambda value: value and value.lower() == property_name.lower()},
+    )
+    return _clean_text(tag.get("content")) if tag else None
+
+
+def _get_meta_name_or_property(soup: BeautifulSoup, key: str) -> str | None:
+    value = _get_meta_content(soup, key)
+    if value:
+        return value
+    return _get_meta_property(soup, key)
 
 
 def _is_indexable(meta_robots: str | None) -> bool:
@@ -211,7 +411,7 @@ def _normalize_link(base_url: str, href: str | None) -> str | None:
     parsed = urlparse(absolute)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    return parsed._replace(fragment="").geturl()
+    return normalize_url(parsed._replace(fragment="").geturl())
 
 
 def _same_domain(hostname: str | None, root_host: str) -> bool:

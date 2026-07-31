@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from app.db.database import SessionLocal
-from app.models import Project
+from app.models import CrawlRun, CrawlRunScore, Project
+from app.services.crawl_runs import cancel_crawl_run
+from app.services.deletions import delete_project
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -27,6 +30,17 @@ class ProjectListResponse(BaseModel):
     page: int
     page_size: int
     items: list[ProjectResponse]
+
+
+class ScoreHistoryItemResponse(BaseModel):
+    crawl_run_id: int
+    date: datetime | None
+    overall_score: float | None
+    category_scores: dict[str, float]
+
+
+class ScoreHistoryResponse(BaseModel):
+    items: list[ScoreHistoryItemResponse]
 
 
 @router.get("", response_model=ProjectListResponse)
@@ -63,3 +77,71 @@ async def create_project(payload: CreateProjectRequest) -> ProjectResponse:
         db.commit()
         db.refresh(project)
         return ProjectResponse(id=project.id, domain=project.domain, created_at=project.created_at)
+
+
+@router.get("/{project_id}/score-history", response_model=ScoreHistoryResponse)
+async def get_project_score_history(project_id: int) -> ScoreHistoryResponse:
+    with SessionLocal() as db:
+        project = db.get(Project, project_id)
+        if project is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Project {project_id} not found.",
+            )
+
+        crawl_runs = list(
+            db.scalars(
+                select(CrawlRun)
+                .where(CrawlRun.project_id == project_id)
+                .options(selectinload(CrawlRun.scores))
+            ).all()
+        )
+        crawl_runs.sort(
+            key=lambda run: (
+                run.finished_at or run.started_at or datetime.min,
+                run.id,
+            )
+        )
+
+        items: list[ScoreHistoryItemResponse] = []
+        for crawl_run in crawl_runs:
+            if not crawl_run.scores:
+                continue
+            category_scores = {
+                score.category: score.score
+                for score in crawl_run.scores
+                if score.category != "overall"
+            }
+            overall_score = next(
+                (score.score for score in crawl_run.scores if score.category == "overall"),
+                None,
+            )
+            items.append(
+                ScoreHistoryItemResponse(
+                    crawl_run_id=crawl_run.id,
+                    date=crawl_run.finished_at or crawl_run.started_at,
+                    overall_score=overall_score,
+                    category_scores=category_scores,
+                )
+            )
+
+        return ScoreHistoryResponse(items=items)
+
+
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def remove_project(project_id: int) -> Response:
+    with SessionLocal() as db:
+        run_ids = list(
+            db.scalars(select(CrawlRun.id).where(CrawlRun.project_id == project_id)).all()
+        )
+    for run_id in run_ids:
+        cancel_crawl_run(run_id)
+
+    with SessionLocal() as db:
+        deleted = delete_project(db, project_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project {project_id} not found.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
