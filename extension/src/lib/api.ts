@@ -119,6 +119,34 @@ export type AuditReport = {
   }[];
 };
 
+export type ScoreHistoryItem = {
+  crawl_run_id: number;
+  date: string | null;
+  overall_score: number | null;
+  category_scores: Record<string, number>;
+};
+
+export type DiffIssue = {
+  rule_id: string;
+  category: string;
+  severity: string;
+  target_url: string | null;
+  message: string;
+};
+
+export type CrawlRunDiff = {
+  current_run_id: number;
+  compare_to_run_id: number;
+  new_issues: DiffIssue[];
+  resolved_issues: DiffIssue[];
+  persisting_issues: DiffIssue[];
+  counts: {
+    new: number;
+    resolved: number;
+    persisting: number;
+  };
+};
+
 type RequestOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
   query?: Record<string, string | number | boolean | null | undefined>;
@@ -216,16 +244,28 @@ export const apiClient = {
     max_pages: number;
     max_depth?: number;
     enable_pagespeed?: boolean | null;
-  }) => api.post<{ crawl_run_id: number; status: string }>("/api/crawl-runs", payload),
+  }) =>
+    api.post<{ crawl_run_id: number; status: string }>("/api/crawl-runs", payload, {
+      timeoutMs: 30_000,
+    }),
   deleteCrawlRun: (id: number) => api.delete(`/api/crawl-runs/${id}`),
-  getCrawlRun: (id: number) => api.get<CrawlRunProgress>(`/api/crawl-runs/${id}`),
+  getCrawlRun: (id: number) =>
+    api.get<CrawlRunProgress>(`/api/crawl-runs/${id}`, { timeoutMs: 30_000 }),
   runAudit: (id: number) =>
     api.post<{ crawl_run_id: number; issues_created: number; scores_created: number }>(
       `/api/crawl-runs/${id}/run-audit`,
+      undefined,
+      { timeoutMs: 120_000 },
     ),
-  getSummary: (id: number) => api.get<CrawlRunSummary>(`/api/crawl-runs/${id}/summary`),
-  getReport: (id: number) => api.get<AuditReport>(`/api/crawl-runs/${id}/report`),
+  getSummary: (id: number) =>
+    api.get<CrawlRunSummary>(`/api/crawl-runs/${id}/summary`, { timeoutMs: 30_000 }),
+  getReport: (id: number) =>
+    api.get<AuditReport>(`/api/crawl-runs/${id}/report`, { timeoutMs: 60_000 }),
   getScores: (id: number) => api.get<{ items: ScoreItem[] }>(`/api/crawl-runs/${id}/scores`),
+  getScoreHistory: (projectId: number) =>
+    api.get<{ items: ScoreHistoryItem[] }>(`/api/projects/${projectId}/score-history`),
+  getCrawlRunDiff: (id: number, compareTo: number) =>
+    api.get<CrawlRunDiff>(`/api/crawl-runs/${id}/diff`, { query: { compare_to: compareTo } }),
   getIssues: (
     id: number,
     query?: { category?: string; severity?: string; page?: number; page_size?: number },

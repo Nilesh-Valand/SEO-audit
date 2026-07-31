@@ -43,8 +43,10 @@ playwright install chromium
 
 ```bash
 cd backend
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn app.main:app --reload --reload-dir app --host 127.0.0.1 --port 8000
 ```
+
+`--reload-dir app` watches only Python code under `app/`, so crawl snapshots written to `backend/data/snapshots/` do not restart the server mid-audit.
 
 - Health: http://127.0.0.1:8000/api/health  
 - Docs: http://127.0.0.1:8000/docs  

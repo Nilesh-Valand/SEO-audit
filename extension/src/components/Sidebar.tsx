@@ -13,7 +13,7 @@ const navItems = [
 
 export function Sidebar() {
   return (
-    <aside className="flex w-64 shrink-0 flex-col bg-gray-900 text-gray-100">
+    <aside className="sticky top-0 flex h-screen w-64 shrink-0 flex-col self-start overflow-y-auto bg-gray-900 text-gray-100">
       <div className="flex items-center gap-3 border-b border-gray-700 px-6 py-5">
         <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-500 text-sm font-bold text-white">
           S

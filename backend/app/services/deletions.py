@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
@@ -12,13 +11,12 @@ from app.models import (
     CrawlRun,
     CrawlRunScore,
     PageLink,
+    PageTechnicalDetails,
     PageVital,
     Project,
     SitemapFinding,
 )
-
-
-SNAPSHOT_ROOT = Path(__file__).resolve().parents[1] / "db" / "snapshots"
+from app.paths import SNAPSHOT_ROOT
 
 
 def _purge_crawl_run_rows(db: Session, crawl_run_id: int) -> None:
@@ -29,6 +27,7 @@ def _purge_crawl_run_rows(db: Session, crawl_run_id: int) -> None:
     if page_ids:
         db.execute(delete(PageLink).where(PageLink.crawled_page_id.in_(page_ids)))
         db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(page_ids)))
+        db.execute(delete(PageTechnicalDetails).where(PageTechnicalDetails.crawled_page_id.in_(page_ids)))
         db.execute(delete(AuditIssue).where(AuditIssue.crawled_page_id.in_(page_ids)))
 
     db.execute(delete(AuditIssue).where(AuditIssue.crawl_run_id == crawl_run_id))

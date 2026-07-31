@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui";
 import {
   labelCategory,
@@ -7,22 +7,36 @@ import {
   SEVERITIES,
   SeverityBadge,
 } from "../components/PageShell";
-import { apiClient, type AuditReport } from "../lib/api";
+import {
+  apiClient,
+  type AuditReport,
+  type CrawlRun,
+  type CrawlRunDiff,
+  type DiffIssue,
+} from "../lib/api";
 import { useAuditSelection } from "../lib/AuditSelectionContext";
 import { downloadCrawlExport, type ExportFormat } from "../lib/downloadExport";
 import { formatBackendError, shouldLinkToSettings } from "../lib/errors";
 import { formatDate, formatScore } from "../lib/format";
 
 type ExportBusy = ExportFormat | null;
+type DiffBucket = "new" | "resolved" | "persisting";
 
 export function ReportPage() {
-  const { crawlRunId, ready } = useAuditSelection();
+  const { projectId, crawlRunId, ready } = useAuditSelection();
   const [report, setReport] = useState<AuditReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [unreachable, setUnreachable] = useState(false);
   const [exportBusy, setExportBusy] = useState<ExportBusy>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+
+  const [previousRun, setPreviousRun] = useState<CrawlRun | null>(null);
+  const [compareEnabled, setCompareEnabled] = useState(false);
+  const [diff, setDiff] = useState<CrawlRunDiff | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [activeBucket, setActiveBucket] = useState<DiffBucket>("new");
 
   useEffect(() => {
     if (!ready || !crawlRunId) return;
@@ -33,10 +47,31 @@ export function ReportPage() {
       setError(null);
       setUnreachable(false);
       setExportError(null);
+      setCompareEnabled(false);
+      setDiff(null);
+      setDiffError(null);
+      setPreviousRun(null);
       try {
         const res = await apiClient.getReport(crawlRunId!);
         if (cancelled) return;
         setReport(res);
+
+        const resolvedProjectId = projectId ?? res.project.id;
+        const runs = await apiClient.listCrawlRuns({
+          project_id: resolvedProjectId,
+          page: 1,
+          page_size: 100,
+        });
+        if (cancelled) return;
+        const ordered = [...runs.items].sort((a, b) => {
+          const aDate = a.finished_at ?? a.started_at ?? "";
+          const bDate = b.finished_at ?? b.started_at ?? "";
+          if (aDate !== bDate) return aDate.localeCompare(bDate);
+          return a.id - b.id;
+        });
+        const currentIndex = ordered.findIndex((run) => run.id === crawlRunId);
+        const prior = currentIndex > 0 ? ordered[currentIndex - 1] : null;
+        setPreviousRun(prior);
       } catch (err) {
         if (cancelled) return;
         setUnreachable(shouldLinkToSettings(err));
@@ -51,7 +86,41 @@ export function ReportPage() {
     return () => {
       cancelled = true;
     };
-  }, [ready, crawlRunId]);
+  }, [ready, crawlRunId, projectId]);
+
+  useEffect(() => {
+    if (!compareEnabled || !crawlRunId || !previousRun) {
+      setDiff(null);
+      setDiffError(null);
+      setDiffLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    async function loadDiff() {
+      setDiffLoading(true);
+      setDiffError(null);
+      try {
+        const result = await apiClient.getCrawlRunDiff(crawlRunId!, previousRun!.id);
+        if (!cancelled) {
+          setDiff(result);
+          setActiveBucket("new");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setDiff(null);
+          setDiffError(await formatBackendError(err));
+        }
+      } finally {
+        if (!cancelled) setDiffLoading(false);
+      }
+    }
+
+    void loadDiff();
+    return () => {
+      cancelled = true;
+    };
+  }, [compareEnabled, crawlRunId, previousRun]);
 
   async function handleExport(format: ExportFormat) {
     if (!crawlRunId || exportBusy) return;
@@ -71,6 +140,13 @@ export function ReportPage() {
   );
 
   const anyExportBusy = exportBusy !== null;
+
+  const bucketIssues = useMemo(() => {
+    if (!diff) return [];
+    if (activeBucket === "new") return diff.new_issues;
+    if (activeBucket === "resolved") return diff.resolved_issues;
+    return diff.persisting_issues;
+  }, [diff, activeBucket]);
 
   return (
     <PageShell
@@ -181,6 +257,91 @@ export function ReportPage() {
             </CardContent>
           </Card>
 
+          <section className="print:hidden break-inside-avoid">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-xl font-bold text-gray-900">Compare to previous audit</h2>
+                <p className="mt-1 text-sm text-gray-500">
+                  {previousRun
+                    ? `Prior run #${previousRun.id}${
+                        previousRun.finished_at || previousRun.started_at
+                          ? ` · ${formatDate(previousRun.finished_at ?? previousRun.started_at)}`
+                          : ""
+                      }`
+                    : "No earlier scored run is available for this project."}
+                </p>
+              </div>
+              <label
+                className={`inline-flex items-center gap-2 text-sm font-semibold ${
+                  previousRun ? "text-gray-800" : "cursor-not-allowed text-gray-400"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-gray-300 text-brand-600 focus:ring-brand-500"
+                  checked={compareEnabled}
+                  disabled={!previousRun}
+                  onChange={(event) => setCompareEnabled(event.target.checked)}
+                />
+                Show comparison
+              </label>
+            </div>
+
+            {compareEnabled ? (
+              <Card>
+                <CardContent className="space-y-5 py-6">
+                  {diffLoading ? (
+                    <p className="text-sm text-gray-500">Loading issue diff…</p>
+                  ) : null}
+                  {diffError ? (
+                    <p className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+                      {diffError}
+                    </p>
+                  ) : null}
+                  {diff ? (
+                    <>
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        {(
+                          [
+                            ["new", "New", diff.counts.new, "#dc2626"],
+                            ["resolved", "Resolved", diff.counts.resolved, "#059669"],
+                            ["persisting", "Persisting", diff.counts.persisting, "#d97706"],
+                          ] as const
+                        ).map(([key, label, count, color]) => (
+                          <button
+                            key={key}
+                            type="button"
+                            onClick={() => setActiveBucket(key)}
+                            className={`rounded-xl border px-4 py-4 text-left transition ${
+                              activeBucket === key
+                                ? "border-gray-900 bg-gray-900 text-white"
+                                : "border-gray-200 bg-white hover:border-gray-300"
+                            }`}
+                          >
+                            <div
+                              className={`text-xs font-medium uppercase tracking-wide ${
+                                activeBucket === key ? "text-gray-300" : "text-gray-500"
+                              }`}
+                            >
+                              {label}
+                            </div>
+                            <div
+                              className="mt-1 text-3xl font-bold tabular-nums"
+                              style={{ color: activeBucket === key ? "#fff" : color }}
+                            >
+                              {count}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                      <DiffIssueList issues={bucketIssues} emptyLabel={`No ${activeBucket} issues.`} />
+                    </>
+                  ) : null}
+                </CardContent>
+              </Card>
+            ) : null}
+          </section>
+
           <section className="break-inside-avoid">
             <h2 className="mb-4 text-xl font-bold text-gray-900">Category breakdown</h2>
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -215,6 +376,10 @@ export function ReportPage() {
 
           <section className="break-inside-avoid">
             <h2 className="mb-4 text-xl font-bold text-gray-900">Prioritized recommendations</h2>
+            <p className="mb-3 text-sm text-gray-500">
+              Ranked by severity weight × pages affected (wider medium issues can outrank rare
+              critical ones).
+            </p>
             {report.recommendations.length === 0 ? (
               <Card>
                 <CardContent className="py-8 text-sm text-gray-500">
@@ -307,6 +472,46 @@ export function ReportPage() {
         </div>
       ) : null}
     </PageShell>
+  );
+}
+
+function DiffIssueList({ issues, emptyLabel }: { issues: DiffIssue[]; emptyLabel: string }) {
+  if (issues.length === 0) {
+    return <p className="text-sm text-gray-500">{emptyLabel}</p>;
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-lg border border-gray-100">
+      <table className="min-w-full text-left text-sm">
+        <thead className="border-b border-gray-100 bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+          <tr>
+            <th className="px-4 py-3 font-medium">Severity</th>
+            <th className="px-4 py-3 font-medium">Rule</th>
+            <th className="px-4 py-3 font-medium">URL</th>
+            <th className="px-4 py-3 font-medium">Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          {issues.map((issue, index) => (
+            <tr key={`${issue.rule_id}-${issue.target_url}-${index}`} className="border-b border-gray-50">
+              <td className="whitespace-nowrap px-4 py-3">
+                <SeverityBadge severity={issue.severity} />
+              </td>
+              <td className="whitespace-nowrap px-4 py-3 font-mono text-xs text-gray-500">
+                {issue.rule_id}
+              </td>
+              <td
+                className="max-w-xs truncate px-4 py-3 text-gray-600"
+                title={issue.target_url ?? undefined}
+              >
+                {issue.target_url ?? "—"}
+              </td>
+              <td className="max-w-lg px-4 py-3 text-gray-900">{issue.message}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

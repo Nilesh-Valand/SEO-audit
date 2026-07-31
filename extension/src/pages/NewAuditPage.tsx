@@ -8,6 +8,7 @@ import { formatBackendError, shouldLinkToSettings } from "../lib/errors";
 import { normalizeUrl, ProgressBar, StatusPill } from "../lib/format";
 
 const POLL_MS = 2500;
+const MAX_POLL_FAILURES = 5;
 
 function domainFromUrl(url: string): string {
   try {
@@ -46,6 +47,7 @@ export function NewAuditPage() {
 
   const pollRef = useRef<number | null>(null);
   const cancelledRef = useRef(false);
+  const pollFailuresRef = useRef(0);
 
   useEffect(() => {
     return () => {
@@ -68,6 +70,9 @@ export function NewAuditPage() {
     const progress = await apiClient.getCrawlRun(runId);
     if (cancelledRef.current) return;
 
+    pollFailuresRef.current = 0;
+    setUnreachable(false);
+    setError(null);
     setStatus(progress.status);
     setPagesCrawled(progress.pages_crawled);
 
@@ -80,9 +85,20 @@ export function NewAuditPage() {
     stopPolling();
 
     if (progress.status === "failed") {
-      setError("Crawl failed. Check the backend logs, then try again.");
+      setError(
+        "Crawl failed. Check the backend terminal for the error, restart uvicorn with `--reload-dir app`, then try again.",
+      );
       setSubmitting(false);
       return;
+    }
+
+    try {
+      const summary = await apiClient.getSummary(runId);
+      if (summary.overall_score == null) {
+        await apiClient.runAudit(runId);
+      }
+    } catch {
+      // Dashboard can still load; scores may be generated on demand later.
     }
 
     await selectAudit(projId, runId);
@@ -91,19 +107,30 @@ export function NewAuditPage() {
 
   function startPolling(runId: number, projId: number) {
     setPolling(true);
-    void pollOnce(runId, projId).catch(async (err) => {
+    pollFailuresRef.current = 0;
+    setUnreachable(false);
+    setError(null);
+
+    const handlePollError = async (err: unknown) => {
+      if (cancelledRef.current) return;
+      pollFailuresRef.current += 1;
+      // Transient blips (reload, brief busy period) should not abort a live crawl.
+      if (pollFailuresRef.current < MAX_POLL_FAILURES) {
+        return;
+      }
       stopPolling();
       setSubmitting(false);
       setUnreachable(shouldLinkToSettings(err));
       setError(await formatBackendError(err));
+    };
+
+    void pollOnce(runId, projId).catch((err) => {
+      void handlePollError(err);
     });
 
     pollRef.current = window.setInterval(() => {
-      void pollOnce(runId, projId).catch(async (err) => {
-        stopPolling();
-        setSubmitting(false);
-        setUnreachable(shouldLinkToSettings(err));
-        setError(await formatBackendError(err));
+      void pollOnce(runId, projId).catch((err) => {
+        void handlePollError(err);
       });
     }, POLL_MS);
   }
@@ -257,7 +284,8 @@ export function NewAuditPage() {
             <p className="text-xs text-gray-500">
               Run #{crawlRunId}
               {projectId ? ` · Project #${projectId}` : ""}
-              {status === "enriching" ? " · Enriching with PageSpeed…" : ""}
+              {status === "enriching" ? " · Running sitemap checks & scoring…" : ""}
+              {status === "completed" ? " · Complete — opening dashboard…" : ""}
             </p>
             {!polling && status === "failed" ? (
               <p className="text-sm text-red-700">

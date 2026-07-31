@@ -132,8 +132,34 @@ export function CurrentPageCheckPage() {
                 <span className="font-medium text-gray-900">Meta robots:</span> {data.metaRobots ?? "—"}
               </div>
               <div>
+                <span className="font-medium text-gray-900">html lang:</span> {data.htmlLang ?? "—"}
+              </div>
+              <div>
+                <span className="font-medium text-gray-900">Favicon:</span>{" "}
+                {data.faviconPresent ? "Detected in head" : "Not found in head"}
+              </div>
+              <div>
+                <span className="font-medium text-gray-900">Open Graph:</span>{" "}
+                {[
+                  data.ogTitle ? "title" : null,
+                  data.ogDescription ? "description" : null,
+                  data.ogImage ? "image" : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ") || "—"}
+              </div>
+              <div>
+                <span className="font-medium text-gray-900">Twitter:</span>{" "}
+                {[data.twitterCard ? `card=${data.twitterCard}` : null, data.twitterTitle ? "title" : null]
+                  .filter(Boolean)
+                  .join(", ") || "—"}
+              </div>
+              <div>
                 <span className="font-medium text-gray-900">Schema @type:</span>{" "}
                 {data.schemaTypes.length ? data.schemaTypes.join(", ") : "—"}
+                {data.schemaParseErrorCount > 0
+                  ? ` · ${data.schemaParseErrorCount} JSON-LD parse error(s)`
+                  : ""}
               </div>
               {data.imagesMissingAlt.count > 0 ? (
                 <div>
@@ -143,6 +169,21 @@ export function CurrentPageCheckPage() {
                     <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-gray-500">
                       {data.imagesMissingAltSamples.map((src) => (
                         <li key={src} className="break-all">
+                          {src}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              ) : null}
+              {data.imagesMissingDimensionsCount > 0 ? (
+                <div>
+                  <span className="font-medium text-gray-900">Images missing dimensions:</span>{" "}
+                  {data.imagesMissingDimensionsCount}
+                  {data.imagesMissingDimensionsSamples.length ? (
+                    <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-gray-500">
+                      {data.imagesMissingDimensionsSamples.map((src) => (
+                        <li key={`dim-${src}`} className="break-all">
                           {src}
                         </li>
                       ))}

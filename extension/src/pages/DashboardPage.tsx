@@ -3,7 +3,11 @@ import { Link } from "react-router-dom";
 import {
   Bar,
   BarChart,
+  CartesianGrid,
   Cell,
+  Legend,
+  Line,
+  LineChart,
   PolarAngleAxis,
   RadialBar,
   RadialBarChart,
@@ -20,10 +24,15 @@ import {
   scoreColor,
   SEVERITIES,
 } from "../components/PageShell";
-import { apiClient, type CrawlRunSummary, type Project } from "../lib/api";
+import {
+  apiClient,
+  type CrawlRunSummary,
+  type Project,
+  type ScoreHistoryItem,
+} from "../lib/api";
 import { useAuditSelection } from "../lib/AuditSelectionContext";
 import { formatBackendError, shouldLinkToSettings } from "../lib/errors";
-import { formatScore, StatusPill } from "../lib/format";
+import { formatDate, formatScore, StatusPill } from "../lib/format";
 
 const SEVERITY_COLORS: Record<string, string> = {
   critical: "#dc2626",
@@ -32,11 +41,25 @@ const SEVERITY_COLORS: Record<string, string> = {
   low: "#0284c7",
 };
 
+const HISTORY_LINE_COLORS = [
+  "#0f172a",
+  "#0284c7",
+  "#059669",
+  "#d97706",
+  "#7c3aed",
+  "#db2777",
+  "#0d9488",
+  "#ea580c",
+  "#4f46e5",
+  "#64748b",
+];
+
 export function DashboardPage() {
   const { projectId, crawlRunId, ready } = useAuditSelection();
   const [project, setProject] = useState<Project | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [summary, setSummary] = useState<CrawlRunSummary | null>(null);
+  const [scoreHistory, setScoreHistory] = useState<ScoreHistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [unreachable, setUnreachable] = useState(false);
@@ -58,17 +81,20 @@ export function DashboardPage() {
         setStatus(run.status);
         setSummary(sum);
 
-        if (projectId) {
-          const projects = await apiClient.listProjects({ page: 1, page_size: 200 });
-          if (!cancelled) {
-            setProject(projects.items.find((p) => p.id === projectId) ?? null);
-          }
-        }
+        const resolvedProjectId = projectId ?? run.project_id;
+        const [projects, history] = await Promise.all([
+          apiClient.listProjects({ page: 1, page_size: 200 }),
+          apiClient.getScoreHistory(resolvedProjectId),
+        ]);
+        if (cancelled) return;
+        setProject(projects.items.find((p) => p.id === resolvedProjectId) ?? null);
+        setScoreHistory(history.items);
       } catch (err) {
         if (cancelled) return;
         setUnreachable(shouldLinkToSettings(err));
         setError(await formatBackendError(err));
         setSummary(null);
+        setScoreHistory([]);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -107,6 +133,32 @@ export function DashboardPage() {
         fill: SEVERITY_COLORS[key],
       })),
     [summary],
+  );
+
+  const historyCategories = useMemo(() => {
+    const keys = new Set<string>();
+    for (const item of scoreHistory) {
+      for (const category of Object.keys(item.category_scores)) {
+        keys.add(category);
+      }
+    }
+    return Array.from(keys).sort((a, b) => labelCategory(a).localeCompare(labelCategory(b)));
+  }, [scoreHistory]);
+
+  const historyChartData = useMemo(
+    () =>
+      scoreHistory.map((item) => {
+        const row: Record<string, string | number | null> = {
+          label: item.date ? formatDate(item.date) : `Run #${item.crawl_run_id}`,
+          runId: item.crawl_run_id,
+          overall: item.overall_score,
+        };
+        for (const category of historyCategories) {
+          row[category] = item.category_scores[category] ?? null;
+        }
+        return row;
+      }),
+    [scoreHistory, historyCategories],
   );
 
   const totalIssues = severityData.reduce((acc, row) => acc + row.count, 0);
@@ -292,6 +344,62 @@ export function DashboardPage() {
               </CardContent>
             </Card>
           ) : null}
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Score over time</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {historyChartData.length < 2 ? (
+                <p className="py-6 text-sm text-gray-500">
+                  {historyChartData.length === 1
+                    ? "Only one scored audit so far. Run another crawl to see trends."
+                    : "No scored audits yet for this project."}
+                </p>
+              ) : (
+                <div className="h-80">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={historyChartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                      <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                      <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} width={36} />
+                      <Tooltip
+                        contentStyle={{ borderRadius: 8, borderColor: "#e5e7eb" }}
+                        formatter={(value, name) => [
+                          value == null ? "—" : Math.round(Number(value)),
+                          name === "overall" ? "Overall" : labelCategory(String(name)),
+                        ]}
+                      />
+                      <Legend
+                        formatter={(value) =>
+                          value === "overall" ? "Overall" : labelCategory(String(value))
+                        }
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="overall"
+                        stroke={HISTORY_LINE_COLORS[0]}
+                        strokeWidth={2.5}
+                        dot={{ r: 3 }}
+                        connectNulls
+                      />
+                      {historyCategories.map((category, index) => (
+                        <Line
+                          key={category}
+                          type="monotone"
+                          dataKey={category}
+                          stroke={HISTORY_LINE_COLORS[(index + 1) % HISTORY_LINE_COLORS.length]}
+                          strokeWidth={1.75}
+                          dot={{ r: 2 }}
+                          connectNulls
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </>
       ) : null}
 

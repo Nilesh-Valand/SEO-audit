@@ -130,16 +130,20 @@ export function scoreColor(score: number | null | undefined): string {
 }
 
 export function labelCategory(category: string): string {
+  if (category === "ai_readiness") return "AI Readiness";
   return category.replace(/_/g, " ");
 }
 
 export const ISSUE_CATEGORIES = [
   "technical",
+  "on_page",
   "content",
   "performance",
   "structured_data",
   "security",
   "indexing",
+  "crawlability",
+  "ai_readiness",
 ] as const;
 
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;

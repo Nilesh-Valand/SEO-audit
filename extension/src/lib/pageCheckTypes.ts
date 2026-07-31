@@ -12,13 +12,24 @@ export type PageExtractResult = {
   headings: HeadingInfo[];
   h1Count: number;
   schemaTypes: string[];
+  schemaBlockCount: number;
+  schemaParseErrorCount: number;
   imagesMissingAlt: { src: string; count: number };
   imagesMissingAltSamples: string[];
+  imagesMissingDimensionsCount: number;
+  imagesMissingDimensionsSamples: string[];
   internalLinkCount: number;
   externalLinkCount: number;
   wordCount: number;
   isHttps: boolean;
   mixedContentUrls: string[];
+  ogTitle: string | null;
+  ogDescription: string | null;
+  ogImage: string | null;
+  twitterCard: string | null;
+  twitterTitle: string | null;
+  htmlLang: string | null;
+  faviconPresent: boolean;
 };
 
 export type RuleSeverity = "critical" | "high" | "medium" | "low";

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from app.config import settings
 from app.db.database import SessionLocal
 from app.models import CrawledPage, CrawlRun, PageVital, SitemapFinding
 
+logger = logging.getLogger(__name__)
 PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 SITEMAP_URL_LIMIT = 5_000
 
@@ -65,6 +67,7 @@ class EnrichmentService:
         crawl_run_id: int,
         *,
         enable_pagespeed: bool | None = None,
+        skip_sitemap: bool = False,
     ) -> None:
         context = await asyncio.to_thread(self._load_run_context, crawl_run_id)
         if context is None or not context.pages:
@@ -81,12 +84,13 @@ class EnrichmentService:
                     if vitals:
                         await asyncio.to_thread(self._save_page_vitals, vitals)
                 except Exception:
-                    pass
+                    logger.exception("PageSpeed enrichment failed for crawl run %s", crawl_run_id)
 
-            try:
-                await self._run_sitemap_check(client, context)
-            except Exception:
-                pass
+            if not skip_sitemap:
+                try:
+                    await self._run_sitemap_check(client, context)
+                except Exception:
+                    logger.exception("Sitemap enrichment failed for crawl run %s", crawl_run_id)
 
     async def _collect_pagespeed_vitals(
         self,
@@ -211,15 +215,21 @@ class EnrichmentService:
         context: CrawlRunContext,
     ) -> None:
         base_url = self._site_root_from_url(context.pages[0].url)
-        sitemap_urls = await self._fetch_sitemap_urls(client, f"{base_url}/sitemap.xml")
-        if not sitemap_urls:
-            return
+        root_sitemap = f"{base_url}/sitemap.xml"
+        sitemap_urls, structure_findings = await self._fetch_sitemap_urls(client, root_sitemap)
 
-        comparison = self._compare_sitemap_to_crawl(context.pages, sitemap_urls)
+        comparison_findings: list[tuple[str, str, str]] = []
+        if sitemap_urls:
+            comparison = self._compare_sitemap_to_crawl(context.pages, sitemap_urls)
+            comparison_findings = comparison.findings
+
         await asyncio.to_thread(
             self._save_sitemap_comparison,
             context.crawl_run_id,
-            comparison,
+            SitemapComparison(
+                findings=[*structure_findings, *comparison_findings],
+                missing_page_ids=[],
+            ),
         )
 
     async def _fetch_sitemap_urls(
@@ -228,27 +238,66 @@ class EnrichmentService:
         sitemap_url: str,
         seen: set[str] | None = None,
         collected: set[str] | None = None,
-    ) -> set[str]:
+        findings: list[tuple[str, str, str]] | None = None,
+        *,
+        is_child: bool = False,
+    ) -> tuple[set[str], list[tuple[str, str, str]]]:
         seen = seen or set()
         collected = collected if collected is not None else set()
+        findings = findings if findings is not None else []
         if len(collected) >= SITEMAP_URL_LIMIT:
-            return collected
+            return collected, findings
 
         normalized_sitemap_url = self._normalize_url(sitemap_url)
         if normalized_sitemap_url in seen:
-            return collected
+            return collected, findings
         seen.add(normalized_sitemap_url)
 
         try:
             response = await client.get(normalized_sitemap_url)
-            response.raise_for_status()
         except httpx.HTTPError:
-            return collected
+            findings.append(
+                (
+                    normalized_sitemap_url,
+                    "sitemap_child_broken" if is_child else "sitemap_not_found",
+                    (
+                        "Child sitemap could not be fetched."
+                        if is_child
+                        else "Sitemap could not be fetched."
+                    ),
+                )
+            )
+            return collected, findings
+
+        if response.status_code >= 400:
+            findings.append(
+                (
+                    normalized_sitemap_url,
+                    "sitemap_child_broken" if is_child else "sitemap_not_found",
+                    (
+                        f"Child sitemap returned HTTP {response.status_code}."
+                        if is_child
+                        else f"Sitemap returned HTTP {response.status_code}."
+                    ),
+                )
+            )
+            return collected, findings
 
         try:
             root = ET.fromstring(response.text)
         except ET.ParseError:
-            return collected
+            findings.append(
+                (
+                    normalized_sitemap_url,
+                    "sitemap_child_broken" if is_child else "sitemap_malformed",
+                    (
+                        "Child sitemap contains invalid XML."
+                        if is_child
+                        else "Sitemap contains invalid XML."
+                    ),
+                )
+            )
+            return collected, findings
 
         tag = self._strip_xml_namespace(root.tag)
         if tag == "sitemapindex":
@@ -261,18 +310,31 @@ class EnrichmentService:
                         sitemap_node.text.strip(),
                         seen,
                         collected,
+                        findings,
+                        is_child=True,
                     )
-            return collected
+            return collected, findings
 
         if tag != "urlset":
-            return collected
+            findings.append(
+                (
+                    normalized_sitemap_url,
+                    "sitemap_child_broken" if is_child else "sitemap_malformed",
+                    (
+                        "Child sitemap root element is not urlset/sitemapindex."
+                        if is_child
+                        else "Sitemap root element is not urlset/sitemapindex."
+                    ),
+                )
+            )
+            return collected, findings
 
         for node in root.findall(".//{*}url/{*}loc"):
             if len(collected) >= SITEMAP_URL_LIMIT:
                 break
             if node.text:
                 collected.add(self._normalize_url(node.text.strip()))
-        return collected
+        return collected, findings
 
     def _compare_sitemap_to_crawl(
         self,
@@ -361,15 +423,9 @@ class EnrichmentService:
         return f"{parsed.scheme}://{parsed.netloc}"
 
     def _normalize_url(self, url: str) -> str:
-        normalized, _ = urldefrag(url)
-        parsed = urlparse(normalized)
-        path = parsed.path or "/"
-        return parsed._replace(
-            scheme=parsed.scheme.lower(),
-            netloc=parsed.netloc.lower(),
-            path=path.rstrip("/") or "/",
-            fragment="",
-        ).geturl()
+        from app.crawler.normalize import normalize_url
+
+        return normalize_url(url)
 
     def _strip_xml_namespace(self, tag: str) -> str:
         return tag.split("}", 1)[-1]

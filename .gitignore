@@ -12,6 +12,15 @@ backend/app/db/*.db-shm
 backend/app/db/*.db-wal
 backend/app/db/snapshots/
 
+# Crawl HTML snapshots (sibling of app/; keep folder via .gitkeep)
+backend/data/*
+!backend/data/snapshots/
+backend/data/snapshots/*
+!backend/data/snapshots/.gitkeep
+
+# Legacy crawl snapshot location (repo root)
+.crawl_data/
+
 # Chrome extension build artifacts
 extension/node_modules/
 extension/dist/

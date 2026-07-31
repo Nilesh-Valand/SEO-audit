@@ -27,6 +27,22 @@ export function extractPageSeoData(): import("./pageCheckTypes").PageExtractResu
   const metaRobots =
     metaContent('meta[name="robots" i]') || metaContent('meta[name="googlebot" i]');
 
+  const ogTitle = metaContent('meta[property="og:title" i]');
+  const ogDescription = metaContent('meta[property="og:description" i]');
+  const ogImage = metaContent('meta[property="og:image" i]');
+  const twitterCard =
+    metaContent('meta[name="twitter:card" i]') || metaContent('meta[property="twitter:card" i]');
+  const twitterTitle =
+    metaContent('meta[name="twitter:title" i]') || metaContent('meta[property="twitter:title" i]');
+
+  const htmlLang = document.documentElement.getAttribute("lang")?.trim() || null;
+
+  const faviconPresent = Boolean(
+    document.querySelector(
+      'link[rel="icon" i], link[rel="shortcut icon" i], link[rel="apple-touch-icon" i], link[rel*="icon" i]',
+    ),
+  );
+
   const headings: { tag: "h1" | "h2" | "h3" | "h4" | "h5" | "h6"; text: string }[] = [];
   document.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((node) => {
     const tag = node.tagName.toLowerCase() as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
@@ -36,9 +52,12 @@ export function extractPageSeoData(): import("./pageCheckTypes").PageExtractResu
   const h1Count = headings.filter((h) => h.tag === "h1").length;
 
   const schemaTypes: string[] = [];
+  let schemaBlockCount = 0;
+  let schemaParseErrorCount = 0;
   document.querySelectorAll('script[type="application/ld+json"]').forEach((script) => {
     const raw = script.textContent?.trim();
     if (!raw) return;
+    schemaBlockCount += 1;
     try {
       const parsed = JSON.parse(raw) as unknown;
       const visit = (node: unknown) => {
@@ -60,18 +79,32 @@ export function extractPageSeoData(): import("./pageCheckTypes").PageExtractResu
       };
       visit(parsed);
     } catch {
-      // ignore invalid JSON-LD
+      schemaParseErrorCount += 1;
     }
   });
 
   const imagesMissingAltSamples: string[] = [];
   let imagesMissingAltCount = 0;
+  const imagesMissingDimensionsSamples: string[] = [];
+  let imagesMissingDimensionsCount = 0;
   document.querySelectorAll("img").forEach((img) => {
+    const src = abs(img.getAttribute("src")) || "(no src)";
     const alt = img.getAttribute("alt");
     if (alt === null || alt.trim() === "") {
       imagesMissingAltCount += 1;
       if (imagesMissingAltSamples.length < 8) {
-        imagesMissingAltSamples.push(abs(img.getAttribute("src")) || "(no src)");
+        imagesMissingAltSamples.push(src);
+      }
+    }
+
+    const widthAttr = img.getAttribute("width");
+    const heightAttr = img.getAttribute("height");
+    const hasWidth = widthAttr !== null && widthAttr.trim() !== "";
+    const hasHeight = heightAttr !== null && heightAttr.trim() !== "";
+    if (!hasWidth || !hasHeight) {
+      imagesMissingDimensionsCount += 1;
+      if (imagesMissingDimensionsSamples.length < 8) {
+        imagesMissingDimensionsSamples.push(src);
       }
     }
   });
@@ -81,7 +114,13 @@ export function extractPageSeoData(): import("./pageCheckTypes").PageExtractResu
   let externalLinkCount = 0;
   document.querySelectorAll("a[href]").forEach((anchor) => {
     const href = anchor.getAttribute("href")?.trim();
-    if (!href || href.startsWith("#") || href.startsWith("mailto:") || href.startsWith("tel:") || href.startsWith("javascript:")) {
+    if (
+      !href ||
+      href.startsWith("#") ||
+      href.startsWith("mailto:") ||
+      href.startsWith("tel:") ||
+      href.startsWith("javascript:")
+    ) {
       return;
     }
     try {
@@ -139,12 +178,23 @@ export function extractPageSeoData(): import("./pageCheckTypes").PageExtractResu
     headings,
     h1Count,
     schemaTypes: Array.from(new Set(schemaTypes)),
+    schemaBlockCount,
+    schemaParseErrorCount,
     imagesMissingAlt: { src: "aggregate", count: imagesMissingAltCount },
     imagesMissingAltSamples,
+    imagesMissingDimensionsCount,
+    imagesMissingDimensionsSamples,
     internalLinkCount,
     externalLinkCount,
     wordCount,
     isHttps,
     mixedContentUrls: Array.from(new Set(mixedContentUrls)),
+    ogTitle,
+    ogDescription,
+    ogImage,
+    twitterCard,
+    twitterTitle,
+    htmlLang,
+    faviconPresent,
   };
 }

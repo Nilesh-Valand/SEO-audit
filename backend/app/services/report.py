@@ -16,7 +16,13 @@ from sqlalchemy.orm import joinedload
 from app.db.database import SessionLocal
 from app.models import AuditIssue, CrawlRun, CrawlRunScore, Project
 
-SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+# Same weights as RuleEngine scoring: impact = weight × pages affected.
+SEVERITY_WEIGHTS = {
+    "critical": 10,
+    "high": 5,
+    "medium": 2,
+    "low": 1,
+}
 
 
 class ReportService:
@@ -81,8 +87,10 @@ class ReportService:
             recommendations = sorted(
                 recommendation_groups.values(),
                 key=lambda item: (
-                    SEVERITY_ORDER.get(item["severity"], 99),
-                    -item["pages_affected"],
+                    -(
+                        SEVERITY_WEIGHTS.get(item["severity"], 1)
+                        * item["pages_affected"]
+                    ),
                     item["rule"],
                 ),
             )
@@ -141,17 +149,276 @@ class ReportService:
                 buffer.truncate(0)
 
     def generate_pdf_file(self, crawl_run_id: int) -> tuple[str, str]:
-        from jinja2 import Template
-        from weasyprint import HTML
+        """Build a PDF report using ReportLab (Windows-friendly; no GTK/WeasyPrint)."""
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            Image,
+            PageBreak,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
 
         report = self.build_report(crawl_run_id)
-        charts = self._build_chart_images(report)
-        template = Template(self._pdf_template())
-        html = template.render(report=report, charts=charts, generated_at=datetime.utcnow().isoformat())
+        chart_paths = self._build_chart_files(report)
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            HTML(string=html).write_pdf(temp_file.name)
-            return temp_file.name, f"crawl-run-{crawl_run_id}-report.pdf"
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        temp_file.close()
+        filename = f"crawl-run-{crawl_run_id}-report.pdf"
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "CoverTitle",
+            parent=styles["Title"],
+            fontSize=22,
+            spaceAfter=18,
+            alignment=TA_CENTER,
+        )
+        score_style = ParagraphStyle(
+            "CoverScore",
+            parent=styles["Title"],
+            fontSize=42,
+            textColor=colors.HexColor("#0284c7"),
+            alignment=TA_CENTER,
+            spaceAfter=12,
+        )
+        heading_style = ParagraphStyle(
+            "SectionHeading",
+            parent=styles["Heading2"],
+            fontSize=14,
+            spaceBefore=16,
+            spaceAfter=8,
+            textColor=colors.HexColor("#111827"),
+        )
+        body_style = ParagraphStyle(
+            "Body",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=12,
+        )
+        small_style = ParagraphStyle(
+            "Small",
+            parent=styles["Normal"],
+            fontSize=8,
+            leading=10,
+            textColor=colors.HexColor("#4b5563"),
+        )
+
+        def safe(text: Any) -> str:
+            return (
+                str(text if text is not None else "")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
+        story: list[Any] = []
+        domain = report["project"].get("domain") or "SEO Audit Report"
+        overall = report["overall_score"]
+        overall_display = f"{overall:.0f}" if isinstance(overall, (int, float)) else "--"
+
+        story.append(Spacer(1, 1.8 * inch))
+        story.append(Paragraph(safe(domain), title_style))
+        story.append(Paragraph(overall_display, score_style))
+        story.append(
+            Paragraph(
+                f"Generated {datetime.utcnow().isoformat()} · Crawl date: {safe(report.get('crawl_date') or 'N/A')}",
+                ParagraphStyle("Meta", parent=small_style, alignment=TA_CENTER),
+            )
+        )
+        story.append(PageBreak())
+
+        story.append(Paragraph("Executive Summary", heading_style))
+        summary = report["summary"]
+        severity = summary.get("issues_by_severity") or {}
+        summary_data = [
+            ["Total pages", str(summary.get("total_pages", 0))],
+            ["Total issues", str(summary.get("total_issues", 0))],
+            ["Critical", str(severity.get("critical", 0))],
+            ["High", str(severity.get("high", 0))],
+            ["Medium", str(severity.get("medium", 0))],
+            ["Low", str(severity.get("low", 0))],
+        ]
+        summary_table = Table(summary_data, colWidths=[2.2 * inch, 4.3 * inch])
+        summary_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f3f4f6")),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]
+            )
+        )
+        story.append(summary_table)
+
+        story.append(Paragraph("Category Scores", heading_style))
+        category_rows = [["Category", "Score"]]
+        for category, score in sorted((report.get("category_scores") or {}).items()):
+            category_rows.append([self._labelize(category), f"{score:.2f}"])
+        if len(category_rows) == 1:
+            category_rows.append(["—", "—"])
+        cat_table = Table(category_rows, colWidths=[4.0 * inch, 2.5 * inch])
+        cat_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0284c7")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        story.append(cat_table)
+
+        if chart_paths.get("category_scores"):
+            story.append(Spacer(1, 0.2 * inch))
+            story.append(Image(chart_paths["category_scores"], width=6.5 * inch, height=2.4 * inch))
+        if chart_paths.get("severity"):
+            story.append(Spacer(1, 0.15 * inch))
+            story.append(Image(chart_paths["severity"], width=6.5 * inch, height=2.4 * inch))
+
+        story.append(Paragraph("Prioritized Recommendations", heading_style))
+        recommendations = report.get("recommendations") or []
+        if not recommendations:
+            story.append(Paragraph("No recommendations for this run.", body_style))
+        else:
+            for index, item in enumerate(recommendations[:40], start=1):
+                story.append(
+                    Paragraph(
+                        f"<b>{index}. {safe(item.get('rule'))}</b> "
+                        f"({safe(item.get('severity'))}, {safe(item.get('pages_affected'))} pages) — "
+                        f"{safe(item.get('message'))}",
+                        body_style,
+                    )
+                )
+                story.append(Spacer(1, 4))
+
+        for category in report.get("categories") or []:
+            story.append(PageBreak())
+            score = category.get("score")
+            score_label = f" — Score {score}" if score is not None else ""
+            story.append(Paragraph(f"{safe(category.get('name'))}{score_label}", heading_style))
+            issues = category.get("issues") or []
+            if not issues:
+                story.append(Paragraph("No issues in this category.", body_style))
+                continue
+
+            rows = [["Severity", "Rule", "URL", "Message"]]
+            for issue in issues[:200]:
+                rows.append(
+                    [
+                        Paragraph(safe(issue.get("severity")), small_style),
+                        Paragraph(safe(issue.get("rule")), small_style),
+                        Paragraph(safe(issue.get("url") or "—"), small_style),
+                        Paragraph(safe(issue.get("message")), small_style),
+                    ]
+                )
+            issue_table = Table(rows, colWidths=[0.85 * inch, 1.2 * inch, 2.1 * inch, 2.35 * inch])
+            issue_table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0, 0), (-1, 0), 8),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+                    ]
+                )
+            )
+            story.append(issue_table)
+            if len(issues) > 200:
+                story.append(
+                    Paragraph(f"Showing first 200 of {len(issues)} issues in this category.", small_style)
+                )
+
+        doc = SimpleDocTemplate(
+            temp_file.name,
+            pagesize=letter,
+            leftMargin=0.6 * inch,
+            rightMargin=0.6 * inch,
+            topMargin=0.6 * inch,
+            bottomMargin=0.6 * inch,
+            title=f"SEO Audit — {domain}",
+        )
+        try:
+            doc.build(story)
+        finally:
+            for path in chart_paths.values():
+                remove_file(path)
+
+        return temp_file.name, filename
+
+    def _build_chart_files(self, report: dict[str, Any]) -> dict[str, str]:
+        import matplotlib.pyplot as plt
+
+        paths: dict[str, str] = {}
+        category_scores = report.get("category_scores") or {}
+        if category_scores:
+            labels = list(category_scores.keys())
+            values = [category_scores[key] for key in labels]
+            paths["category_scores"] = self._chart_to_temp_png(
+                plt, labels, values, "Category Scores"
+            )
+
+        severity_counts = (report.get("summary") or {}).get("issues_by_severity") or {}
+        if severity_counts:
+            labels = list(severity_counts.keys())
+            values = [severity_counts[key] for key in labels]
+            paths["severity"] = self._chart_to_temp_png(plt, labels, values, "Issues by Severity")
+        return paths
+
+    def _chart_to_temp_png(self, plt: Any, labels: list[str], values: list[Any], title: str) -> str:
+        fig, ax = plt.subplots(figsize=(8, 3.2))
+        ax.bar([self._labelize(str(label)) for label in labels], values, color="#0284c7")
+        ax.set_title(title)
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        fig.tight_layout()
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        temp_file.close()
+        fig.savefig(temp_file.name, format="png", dpi=140)
+        plt.close(fig)
+        return temp_file.name
+
+    def _build_chart_images(self, report: dict[str, Any]) -> dict[str, str]:
+        import matplotlib.pyplot as plt
+
+        category_chart = self._chart_to_data_uri(
+            plt,
+            list(report["category_scores"].keys()),
+            [report["category_scores"][key] for key in report["category_scores"]],
+            "Category Scores",
+        )
+        severity_counts = report["summary"]["issues_by_severity"]
+        severity_chart = self._chart_to_data_uri(
+            plt,
+            list(severity_counts.keys()),
+            [severity_counts[key] for key in severity_counts],
+            "Issues by Severity",
+        )
+        return {"category_scores": category_chart, "severity": severity_chart}
 
     def generate_xlsx_file(self, crawl_run_id: int) -> tuple[str, str]:
         from openpyxl import Workbook
