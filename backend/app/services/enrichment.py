@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urldefrag, urlparse
 
 import httpx
@@ -12,9 +14,9 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.database import SessionLocal
-from app.models import CrawledPage, CrawlRun, SitemapFinding
+from app.models import CrawledPage, CrawlRun, PageVital, SitemapFinding
 
-# Cap sitemap expansion so giant sites (Shopify, etc.) do not flood the DB.
+PAGESPEED_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 SITEMAP_URL_LIMIT = 5_000
 
 
@@ -35,29 +37,173 @@ class CrawlRunContext:
 
 
 @dataclass(slots=True)
+class PageVitalRecord:
+    crawled_page_id: int
+    lcp_ms: float | None
+    inp_ms: float | None
+    cls: float | None
+    performance_score: int | None
+    strategy: str
+
+
+@dataclass(slots=True)
 class SitemapComparison:
     findings: list[tuple[str, str, str]]
     missing_page_ids: list[int]
 
 
 class EnrichmentService:
-    """Post-crawl enrichment. Currently sitemap comparison only (no external API keys)."""
+    """Post-crawl enrichment: sitemap always; PageSpeed when ENABLE_PAGESPEED=true."""
 
     def __init__(self, session_factory: Callable[[], Session] = SessionLocal) -> None:
         self._session_factory = session_factory
+        self._pagespeed_lock = asyncio.Lock()
+        self._next_pagespeed_at = 0.0
 
-    async def enrich_crawl_run(self, crawl_run_id: int, **_: object) -> None:
+    async def enrich_crawl_run(
+        self,
+        crawl_run_id: int,
+        *,
+        enable_pagespeed: bool | None = None,
+    ) -> None:
         context = await asyncio.to_thread(self._load_run_context, crawl_run_id)
         if context is None or not context.pages:
             return
 
+        run_pagespeed = settings.ENABLE_PAGESPEED if enable_pagespeed is None else enable_pagespeed
+
         headers = {"User-Agent": settings.CRAWLER_USER_AGENT}
         timeout = httpx.Timeout(30.0, connect=10.0)
         async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+            if run_pagespeed:
+                try:
+                    vitals = await self._collect_pagespeed_vitals(client, context.pages)
+                    if vitals:
+                        await asyncio.to_thread(self._save_page_vitals, vitals)
+                except Exception:
+                    pass
+
             try:
                 await self._run_sitemap_check(client, context)
             except Exception:
                 pass
+
+    async def _collect_pagespeed_vitals(
+        self,
+        client: httpx.AsyncClient,
+        pages: list[PageRecord],
+    ) -> list[PageVitalRecord]:
+        sample = [
+            page
+            for page in pages
+            if page.status_code and 200 <= page.status_code < 400 and page.is_indexable
+        ][: settings.ENRICHMENT_PAGESPEED_SAMPLE_LIMIT]
+
+        semaphore = asyncio.Semaphore(settings.ENRICHMENT_PAGESPEED_BATCH_SIZE)
+        records: list[PageVitalRecord] = []
+
+        async def fetch_one(page: PageRecord, strategy: str) -> None:
+            async with semaphore:
+                metrics = await self._fetch_pagespeed_metrics(client, page.url, strategy)
+                if metrics is None:
+                    return
+                records.append(
+                    PageVitalRecord(
+                        crawled_page_id=page.id,
+                        lcp_ms=metrics.get("lcp_ms"),  # type: ignore[arg-type]
+                        inp_ms=metrics.get("inp_ms"),  # type: ignore[arg-type]
+                        cls=metrics.get("cls"),  # type: ignore[arg-type]
+                        performance_score=metrics.get("performance_score"),  # type: ignore[arg-type]
+                        strategy=strategy,
+                    )
+                )
+
+        await asyncio.gather(
+            *(fetch_one(page, strategy) for page in sample for strategy in ("mobile", "desktop"))
+        )
+        return records
+
+    async def _fetch_pagespeed_metrics(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        strategy: str,
+    ) -> dict[str, float | int | None] | None:
+        params: dict[str, str] = {"url": url, "strategy": strategy, "category": "performance"}
+        if settings.PAGESPEED_API_KEY:
+            params["key"] = settings.PAGESPEED_API_KEY
+
+        backoff = settings.ENRICHMENT_PAGESPEED_REQUEST_DELAY
+        for attempt in range(settings.ENRICHMENT_PAGESPEED_MAX_RETRIES):
+            await self._wait_for_pagespeed_slot()
+            try:
+                response = await client.get(PAGESPEED_ENDPOINT, params=params)
+                if response.status_code == 429:
+                    await asyncio.sleep(backoff * (attempt + 1))
+                    continue
+                if response.status_code >= 400:
+                    return None
+                return self._parse_pagespeed_payload(response.json())
+            except httpx.HTTPError:
+                if attempt == settings.ENRICHMENT_PAGESPEED_MAX_RETRIES - 1:
+                    return None
+                await asyncio.sleep(backoff * (attempt + 1))
+        return None
+
+    async def _wait_for_pagespeed_slot(self) -> None:
+        async with self._pagespeed_lock:
+            now = time.monotonic()
+            wait_time = self._next_pagespeed_at - now
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            self._next_pagespeed_at = time.monotonic() + settings.ENRICHMENT_PAGESPEED_REQUEST_DELAY
+
+    def _parse_pagespeed_payload(self, payload: dict[str, Any]) -> dict[str, float | int | None]:
+        lighthouse = payload.get("lighthouseResult", {})
+        audits = lighthouse.get("audits", {})
+
+        lcp = self._numeric_value(audits.get("largest-contentful-paint"))
+        inp = self._numeric_value(audits.get("interaction-to-next-paint"))
+        if inp is None:
+            inp = self._numeric_value(audits.get("total-blocking-time"))
+        cls = self._numeric_value(audits.get("cumulative-layout-shift"))
+
+        performance = lighthouse.get("categories", {}).get("performance", {}).get("score")
+        performance_score = None
+        if isinstance(performance, (int, float)):
+            performance_score = int(round(performance * 100))
+
+        return {
+            "lcp_ms": lcp,
+            "inp_ms": inp,
+            "cls": cls,
+            "performance_score": performance_score,
+        }
+
+    def _numeric_value(self, audit: dict[str, Any] | None) -> float | None:
+        if not isinstance(audit, dict):
+            return None
+        value = audit.get("numericValue")
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _save_page_vitals(self, records: list[PageVitalRecord]) -> None:
+        page_ids = list({record.crawled_page_id for record in records})
+        with self._session_factory() as db:
+            db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(page_ids)))
+            for record in records:
+                db.add(
+                    PageVital(
+                        crawled_page_id=record.crawled_page_id,
+                        lcp_ms=record.lcp_ms,
+                        inp_ms=record.inp_ms,
+                        cls=record.cls,
+                        performance_score=record.performance_score,
+                        strategy=record.strategy,
+                    )
+                )
+            db.commit()
 
     async def _run_sitemap_check(
         self,
@@ -143,7 +289,6 @@ class EnrichmentService:
         missing_page_ids: list[int] = []
         not_crawled = sorted(sitemap_urls - set(crawled_pages))
 
-        # One summary finding instead of thousands of per-URL noise on large sites.
         if not_crawled:
             sample = ", ".join(not_crawled[:5])
             extra = len(not_crawled) - min(5, len(not_crawled))

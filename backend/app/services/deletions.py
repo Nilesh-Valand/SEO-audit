@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -11,8 +11,6 @@ from app.models import (
     CrawledPage,
     CrawlRun,
     CrawlRunScore,
-    GscCredential,
-    GscSnapshot,
     PageLink,
     PageVital,
     Project,
@@ -68,8 +66,13 @@ def delete_project(db: Session, project_id: int) -> bool:
     for run_id in run_ids:
         _purge_crawl_run_rows(db, run_id)
 
-    db.execute(delete(GscSnapshot).where(GscSnapshot.project_id == project_id))
-    db.execute(delete(GscCredential).where(GscCredential.project_id == project_id))
+    # Legacy GSC tables may still exist from older migrations; clear them without ORM models.
+    for table in ("gsc_snapshots", "gsc_credentials"):
+        try:
+            db.execute(text(f"DELETE FROM {table} WHERE project_id = :project_id"), {"project_id": project_id})
+        except Exception:
+            pass
+
     db.execute(delete(Project).where(Project.id == project_id))
     db.commit()
 

@@ -29,6 +29,7 @@ def start_crawl_run(
     start_url: str,
     max_pages: int,
     max_depth: int = 3,
+    enable_pagespeed: bool | None = None,
 ) -> None:
     storage = CrawlStorage()
 
@@ -46,7 +47,10 @@ def start_crawl_run(
             )
             await service.crawl(crawl_run_id)
             storage.set_run_enriching(crawl_run_id)
-            await EnrichmentService().enrich_crawl_run(crawl_run_id)
+            await EnrichmentService().enrich_crawl_run(
+                crawl_run_id,
+                enable_pagespeed=enable_pagespeed,
+            )
             try:
                 await asyncio.to_thread(RuleEngine().run, crawl_run_id)
             except Exception as exc:

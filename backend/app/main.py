@@ -3,10 +3,12 @@ import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 # Windows + Playwright needs ProactorEventLoop for subprocess support.
-# Even with this, Playwright may still fail under uvicorn --reload; the crawler
-# treats Playwright as optional and continues with httpx HTML crawling.
+# Playwright is optional; the crawler continues with httpx if it fails.
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -17,13 +19,48 @@ from app.api.projects import router as projects_router
 
 app = FastAPI(title="SEO Audit API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+class ChromeExtensionCorsMiddleware(BaseHTTPMiddleware):
+    """In development, reflect chrome-extension:// origins so unpacked IDs work
+    before ALLOWED_ORIGINS is set. Prefer an explicit chrome-extension://<id>
+    in ALLOWED_ORIGINS once the extension ID is known.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        origin = request.headers.get("origin", "")
+        is_extension = origin.startswith("chrome-extension://")
+        allow = is_extension and settings.ENV == "development"
+
+        if request.method == "OPTIONS" and allow:
+            return Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": request.headers.get(
+                        "access-control-request-headers", "*"
+                    ),
+                    "Access-Control-Allow-Credentials": "true",
+                },
+            )
+
+        response = await call_next(request)
+        if allow:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+
+if settings.allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+elif settings.ENV == "development":
+    app.add_middleware(ChromeExtensionCorsMiddleware)
 
 app.include_router(health_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
