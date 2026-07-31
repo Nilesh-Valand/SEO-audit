@@ -395,7 +395,8 @@ class RuleEngine:
                 rule_id=rule.id,
                 category=rule.category,
                 severity=rule.severity,
-                message="URL is present in the sitemap but was not crawled in this run.",
+                message=finding.message
+                or "Sitemap URLs were not covered by this crawl. Increase max pages for broader coverage.",
             )
             for finding in findings
             if finding.finding_type == "in_sitemap_not_crawled"
@@ -458,6 +459,7 @@ class RuleEngine:
         threshold: float,
         message_template: str,
     ) -> list[IssueRecord]:
+        # Skipped automatically when ENABLE_PAGESPEED is off / no vitals exist.
         issues: list[IssueRecord] = []
         for page in pages:
             candidates = [getattr(vital, field_name) for vital in page.vitals.values()]

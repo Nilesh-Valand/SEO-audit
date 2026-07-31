@@ -10,16 +10,15 @@ venv/
 backend/app/db/*.db
 backend/app/db/*.db-shm
 backend/app/db/*.db-wal
+backend/app/db/snapshots/
 
-# Node / Next.js
-node_modules/
-.next/
-frontend/.env.local
-frontend/out/
+# Chrome extension build artifacts
+extension/node_modules/
+extension/dist/
+extension/releases/
+extension/*.zip
 
-# Docker
+# Logs / OS
 *.log
-
-# OS
 .DS_Store
 Thumbs.db

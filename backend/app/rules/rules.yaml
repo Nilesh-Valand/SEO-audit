@@ -85,7 +85,7 @@
   condition: mixed_content
 - id: sitemap_orphan
   category: indexing
-  description: URL appears in sitemap but was not crawled.
+  description: Sitemap lists URLs that were not covered by this crawl.
   severity: medium
   condition: sitemap_orphan
 - id: crawled_not_in_sitemap
