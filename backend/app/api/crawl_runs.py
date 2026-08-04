@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
@@ -14,13 +14,16 @@ from app.crawler.storage import CrawlStorage
 from app.db.database import SessionLocal
 from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore
 from app.rules.engine import RuleEngine
-from app.services.crawl_runs import get_progress, is_active, start_crawl_run
+from app.services.crawl_runs import cancel_crawl_run, get_progress, is_active, start_crawl_run
+from app.services.deletions import delete_crawl_run
 from app.services.report import ReportService, iter_file_chunks, remove_file
 
 router = APIRouter(prefix="/crawl-runs", tags=["crawl-runs"])
 storage = CrawlStorage()
 rule_engine = RuleEngine()
 report_service = ReportService()
+_ACTIVE_ORPHAN_TASKS: set[asyncio.Task[None]] = set()
+_ORPHAN_AUDIT_STARTED: set[int] = set()
 
 
 class CreateCrawlRunRequest(BaseModel):
@@ -28,7 +31,7 @@ class CreateCrawlRunRequest(BaseModel):
     start_url: HttpUrl
     max_pages: int = Field(default=200, ge=1, le=5000)
     max_depth: int = Field(default=3, ge=0, le=20)
-    enable_pagespeed: bool = True
+    enable_pagespeed: bool | None = None
 
 
 class CrawlRunResponse(BaseModel):
@@ -172,6 +175,23 @@ class ReportResponse(BaseModel):
     recommendations: list[RecommendationResponse]
 
 
+class DiffIssueResponse(BaseModel):
+    rule_id: str
+    category: str
+    severity: str
+    target_url: str | None
+    message: str
+
+
+class CrawlRunDiffResponse(BaseModel):
+    current_run_id: int
+    compare_to_run_id: int
+    new_issues: list[DiffIssueResponse]
+    resolved_issues: list[DiffIssueResponse]
+    persisting_issues: list[DiffIssueResponse]
+    counts: dict[str, int]
+
+
 def _require_crawl_run(crawl_run_id: int) -> CrawlRun:
     crawl_run = storage.get_run(crawl_run_id)
     if crawl_run is None:
@@ -262,6 +282,56 @@ async def create_crawl_run(payload: CreateCrawlRunRequest) -> CrawlRunResponse:
 @router.get("/{crawl_run_id}", response_model=CrawlRunProgressResponse)
 async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
     crawl_run = _require_crawl_run(crawl_run_id)
+    active = is_active(crawl_run.id)
+
+    # Heal runs left in running/enriching after a server reload killed the worker.
+    # Keep this path fast — never run the full rules engine inline on poll requests.
+    if crawl_run.status in {"running", "enriching"} and not active:
+        with SessionLocal() as db:
+            page_count = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(CrawledPage)
+                    .where(CrawledPage.crawl_run_id == crawl_run_id)
+                )
+                or 0
+            )
+            score_count = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(CrawlRunScore)
+                    .where(CrawlRunScore.crawl_run_id == crawl_run_id)
+                )
+                or 0
+            )
+        if page_count > 0 and score_count > 0:
+            storage.set_run_completed(crawl_run_id)
+            crawl_run = _require_crawl_run(crawl_run_id)
+        elif page_count > 0:
+            # Finish scoring in the background so progress polls stay responsive.
+            storage.set_run_enriching(crawl_run_id)
+            if crawl_run_id not in _ORPHAN_AUDIT_STARTED:
+                _ORPHAN_AUDIT_STARTED.add(crawl_run_id)
+
+                async def _finish_orphan_audit(run_id: int = crawl_run_id) -> None:
+                    try:
+                        await asyncio.to_thread(rule_engine.run, run_id)
+                        storage.set_run_completed(run_id)
+                    except Exception:
+                        storage.set_run_failed(run_id)
+                    finally:
+                        _ORPHAN_AUDIT_STARTED.discard(run_id)
+
+                task = asyncio.create_task(
+                    _finish_orphan_audit(), name=f"orphan-audit-{crawl_run_id}"
+                )
+                _ACTIVE_ORPHAN_TASKS.add(task)
+                task.add_done_callback(_ACTIVE_ORPHAN_TASKS.discard)
+            crawl_run = _require_crawl_run(crawl_run_id)
+        else:
+            storage.set_run_failed(crawl_run_id)
+            crawl_run = _require_crawl_run(crawl_run_id)
+
     return CrawlRunProgressResponse(
         id=crawl_run.id,
         project_id=crawl_run.project_id,
@@ -269,8 +339,23 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
         pages_crawled=max(crawl_run.total_urls, get_progress(crawl_run.id) or 0),
         started_at=crawl_run.started_at,
         finished_at=crawl_run.finished_at,
-        active=is_active(crawl_run.id),
+        active=is_active(crawl_run.id) or any(
+            not t.done() and t.get_name() == f"orphan-audit-{crawl_run.id}" for t in _ACTIVE_ORPHAN_TASKS
+        ),
     )
+
+
+@router.delete("/{crawl_run_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def remove_crawl_run(crawl_run_id: int) -> Response:
+    cancel_crawl_run(crawl_run_id)
+    with SessionLocal() as db:
+        deleted = delete_crawl_run(db, crawl_run_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Crawl run {crawl_run_id} not found.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{crawl_run_id}/summary", response_model=CrawlRunSummaryResponse)
@@ -309,10 +394,24 @@ async def get_crawl_run_summary(crawl_run_id: int) -> CrawlRunSummaryResponse:
 @router.post("/{crawl_run_id}/run-audit", response_model=RunAuditResponse)
 async def run_audit(crawl_run_id: int) -> RunAuditResponse:
     crawl_run = _require_crawl_run(crawl_run_id)
-    if crawl_run.status != "completed":
+    if crawl_run.status not in {"completed", "failed", "enriching"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Audit can only run after the crawl has completed.",
+            detail="Audit can only run after the crawl has produced pages.",
+        )
+    with SessionLocal() as db:
+        page_count = (
+            db.scalar(
+                select(func.count())
+                .select_from(CrawledPage)
+                .where(CrawledPage.crawl_run_id == crawl_run_id)
+            )
+            or 0
+        )
+    if page_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No crawled pages available to audit.",
         )
 
     try:
@@ -323,7 +422,14 @@ async def run_audit(crawl_run_id: int) -> RunAuditResponse:
             detail=str(exc),
         ) from exc
 
-    return RunAuditResponse(crawl_run_id=crawl_run_id, **result)
+    if crawl_run.status != "completed":
+        storage.set_run_completed(crawl_run_id)
+
+    return RunAuditResponse(
+        crawl_run_id=crawl_run_id,
+        issues_created=result["issues_created"],
+        scores_created=result["scores_created"],
+    )
 
 
 @router.get("/{crawl_run_id}/issues", response_model=AuditIssueListResponse)
@@ -466,6 +572,89 @@ async def get_crawl_run_scores(crawl_run_id: int) -> ScoreListResponse:
         )
 
 
+def _issue_match_key(issue: AuditIssue) -> tuple[str, str]:
+    url = issue.target_url or (issue.crawled_page.url if issue.crawled_page else None) or ""
+    return (url, issue.rule_id)
+
+
+def _to_diff_issue(issue: AuditIssue) -> DiffIssueResponse:
+    url = issue.target_url or (issue.crawled_page.url if issue.crawled_page else None)
+    return DiffIssueResponse(
+        rule_id=issue.rule_id,
+        category=issue.category,
+        severity=issue.severity,
+        target_url=url,
+        message=issue.message,
+    )
+
+
+@router.get("/{crawl_run_id}/diff", response_model=CrawlRunDiffResponse)
+async def get_crawl_run_diff(
+    crawl_run_id: int,
+    compare_to: int = Query(..., ge=1, description="Previous crawl run id to compare against"),
+) -> CrawlRunDiffResponse:
+    current = _require_crawl_run(crawl_run_id)
+    previous = _require_crawl_run(compare_to)
+    if current.project_id != previous.project_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="compare_to must belong to the same project as the current crawl run.",
+        )
+    if crawl_run_id == compare_to:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="compare_to must be a different crawl run.",
+        )
+
+    with SessionLocal() as db:
+        current_issues = db.scalars(
+            select(AuditIssue)
+            .where(AuditIssue.crawl_run_id == crawl_run_id)
+            .options(joinedload(AuditIssue.crawled_page))
+            .order_by(AuditIssue.id.asc())
+        ).all()
+        previous_issues = db.scalars(
+            select(AuditIssue)
+            .where(AuditIssue.crawl_run_id == compare_to)
+            .options(joinedload(AuditIssue.crawled_page))
+            .order_by(AuditIssue.id.asc())
+        ).all()
+
+        current_by_key: dict[tuple[str, str], AuditIssue] = {}
+        for issue in current_issues:
+            key = _issue_match_key(issue)
+            current_by_key.setdefault(key, issue)
+
+        previous_by_key: dict[tuple[str, str], AuditIssue] = {}
+        for issue in previous_issues:
+            key = _issue_match_key(issue)
+            previous_by_key.setdefault(key, issue)
+
+        current_keys = set(current_by_key)
+        previous_keys = set(previous_by_key)
+
+        new_issues = [_to_diff_issue(current_by_key[key]) for key in sorted(current_keys - previous_keys)]
+        resolved_issues = [
+            _to_diff_issue(previous_by_key[key]) for key in sorted(previous_keys - current_keys)
+        ]
+        persisting_issues = [
+            _to_diff_issue(current_by_key[key]) for key in sorted(current_keys & previous_keys)
+        ]
+
+        return CrawlRunDiffResponse(
+            current_run_id=crawl_run_id,
+            compare_to_run_id=compare_to,
+            new_issues=new_issues,
+            resolved_issues=resolved_issues,
+            persisting_issues=persisting_issues,
+            counts={
+                "new": len(new_issues),
+                "resolved": len(resolved_issues),
+                "persisting": len(persisting_issues),
+            },
+        )
+
+
 @router.get("/{crawl_run_id}/report", response_model=ReportResponse)
 async def get_crawl_run_report(crawl_run_id: int) -> ReportResponse:
     _require_crawl_run(crawl_run_id)
@@ -502,7 +691,13 @@ async def export_crawl_run_xlsx(crawl_run_id: int) -> StreamingResponse:
 @router.get("/{crawl_run_id}/export/pdf")
 async def export_crawl_run_pdf(crawl_run_id: int) -> StreamingResponse:
     _require_crawl_run(crawl_run_id)
-    file_path, filename = await asyncio.to_thread(report_service.generate_pdf_file, crawl_run_id)
+    try:
+        file_path, filename = await asyncio.to_thread(report_service.generate_pdf_file, crawl_run_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"PDF export failed: {exc}",
+        ) from exc
     return StreamingResponse(
         iter_file_chunks(file_path),
         media_type="application/pdf",
