@@ -1,10 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  Bar,
-  BarChart,
+  AlertTriangle,
+  ArrowRight,
+  FileSearch,
+  Gauge,
+  Layers,
+  ListChecks,
+  TrendingUp,
+} from "lucide-react";
+import {
   CartesianGrid,
-  Cell,
   Legend,
   Line,
   LineChart,
@@ -20,6 +26,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui";
 import {
   labelCategory,
   PageShell,
+  relativeScoreColor,
   RunContextLinks,
   scoreColor,
   SEVERITIES,
@@ -44,15 +51,23 @@ const SEVERITY_COLORS: Record<string, string> = {
 const HISTORY_LINE_COLORS = [
   "#0f172a",
   "#0284c7",
-  "#059669",
-  "#d97706",
-  "#7c3aed",
-  "#db2777",
   "#0d9488",
-  "#ea580c",
-  "#4f46e5",
+  "#d97706",
+  "#475569",
+  "#0369a1",
+  "#059669",
+  "#b45309",
+  "#334155",
   "#64748b",
 ];
+
+function healthLabel(score: number | null): { label: string; tone: string } {
+  if (score == null) return { label: "Awaiting score", tone: "text-slate-500" };
+  if (score >= 80) return { label: "Strong health", tone: "text-emerald-600" };
+  if (score >= 60) return { label: "Needs attention", tone: "text-sky-600" };
+  if (score >= 40) return { label: "At risk", tone: "text-amber-600" };
+  return { label: "Critical gaps", tone: "text-red-600" };
+}
 
 export function DashboardPage() {
   const { projectId, crawlRunId, ready } = useAuditSelection();
@@ -107,23 +122,42 @@ export function DashboardPage() {
   }, [ready, crawlRunId, projectId]);
 
   const overall = summary?.overall_score ?? null;
+  const health = healthLabel(overall);
+
   const gaugeData = useMemo(
     () => [{ name: "score", value: Math.max(0, Math.min(100, overall ?? 0)), fill: scoreColor(overall) }],
     [overall],
   );
 
-  const categoryData = useMemo(
-    () =>
-      Object.entries(summary?.category_scores ?? {})
-        .map(([category, score]) => ({
-          category,
-          label: labelCategory(category),
-          score: Math.round(score),
-          fill: scoreColor(score),
-        }))
-        .sort((a, b) => a.label.localeCompare(b.label)),
-    [summary],
-  );
+  const categoryData = useMemo(() => {
+    const rows = Object.entries(summary?.category_scores ?? {})
+      .map(([category, score]) => ({
+        category,
+        label: labelCategory(category),
+        score: Math.round(score),
+      }))
+      .sort((a, b) => a.score - b.score || a.label.localeCompare(b.label));
+
+    if (rows.length === 0) return [];
+
+    const minScore = rows[0].score;
+    const maxScore = rows[rows.length - 1].score;
+
+    return rows.map((row, index) => {
+      // Prefer relative spread so close high scores (87–100) stay visually distinct.
+      const fill =
+        maxScore === minScore
+          ? scoreColor(row.score)
+          : relativeScoreColor(row.score, minScore, maxScore);
+      return {
+        ...row,
+        fill,
+        rank: index + 1,
+        isFocus: index < Math.min(2, rows.length),
+        gapFromBest: maxScore - row.score,
+      };
+    });
+  }, [summary]);
 
   const severityData = useMemo(
     () =>
@@ -162,13 +196,18 @@ export function DashboardPage() {
   );
 
   const totalIssues = severityData.reduce((acc, row) => acc + row.count, 0);
+  const urgentIssues =
+    (summary?.total_issues_by_severity?.critical ?? 0) +
+    (summary?.total_issues_by_severity?.high ?? 0);
+  const weakest = categoryData[0] ?? null;
+  const strongest = categoryData.length ? categoryData[categoryData.length - 1] : null;
 
   return (
     <PageShell
       title="Dashboard"
       subtitle={
         crawlRunId
-          ? `${project?.domain ?? `Project #${projectId}`} · Run #${crawlRunId}`
+          ? `Audit analysis for ${project?.domain ?? `project #${projectId}`} · Run #${crawlRunId}`
           : "No audit selected."
       }
       actions={
@@ -186,185 +225,319 @@ export function DashboardPage() {
       unreachable={unreachable}
     >
       {summary ? (
-        <>
-          <div className="grid gap-6 lg:grid-cols-12">
-            <Card className="lg:col-span-4">
-              <CardHeader>
-                <CardTitle>Overall score</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="relative mx-auto h-56 w-full max-w-xs">
+        <div className="space-y-6">
+          {/* Health hero */}
+          <section className="overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+            <div className="grid lg:grid-cols-[280px_1fr]">
+              <div className="relative border-b border-slate-100 bg-[radial-gradient(circle_at_30%_20%,rgba(14,165,233,0.12),transparent_55%),linear-gradient(180deg,#f8fafc_0%,#ffffff_100%)] px-6 py-8 lg:border-b-0 lg:border-r">
+                <div className="mb-4 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                  <Gauge className="h-3.5 w-3.5" />
+                  Overall health
+                </div>
+                <div className="relative mx-auto h-48 w-48">
                   <ResponsiveContainer width="100%" height="100%">
                     <RadialBarChart
                       cx="50%"
                       cy="50%"
-                      innerRadius="72%"
+                      innerRadius="78%"
                       outerRadius="100%"
                       data={gaugeData}
                       startAngle={90}
                       endAngle={-270}
                     >
                       <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
-                      <RadialBar background dataKey="value" cornerRadius={12} />
+                      <RadialBar background={{ fill: "#e2e8f0" }} dataKey="value" cornerRadius={14} />
                     </RadialBarChart>
                   </ResponsiveContainer>
                   <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-                    <div className="text-5xl font-bold tabular-nums text-gray-900">
+                    <div
+                      className="text-5xl font-semibold tabular-nums tracking-tight"
+                      style={{ color: scoreColor(overall) }}
+                    >
                       {formatScore(overall)}
                     </div>
-                    <div className="mt-1 text-xs font-medium uppercase tracking-wide text-gray-500">
+                    <div className="mt-1 text-[11px] font-medium uppercase tracking-wider text-slate-400">
                       / 100
                     </div>
                   </div>
                 </div>
-                <div className="mt-2 grid grid-cols-2 gap-3 text-center text-sm">
-                  <div className="rounded-lg bg-gray-50 px-3 py-2">
-                    <div className="text-xs uppercase tracking-wide text-gray-500">Pages</div>
-                    <div className="mt-0.5 text-xl font-bold text-gray-900">{summary.total_pages}</div>
-                  </div>
-                  <div className="rounded-lg bg-gray-50 px-3 py-2">
-                    <div className="text-xs uppercase tracking-wide text-gray-500">Issues</div>
-                    <div className="mt-0.5 text-xl font-bold text-gray-900">{totalIssues}</div>
-                  </div>
+                <div className={`mt-4 text-center text-sm font-semibold ${health.tone}`}>
+                  {health.label}
                 </div>
-              </CardContent>
-            </Card>
+              </div>
 
-            <Card className="lg:col-span-8">
-              <CardHeader className="flex flex-row items-center justify-between">
-                <CardTitle>Issues by severity</CardTitle>
-                <Link to="/issues" className="text-sm font-semibold text-brand-700 hover:underline">
-                  View all →
+              <div className="flex flex-col justify-between gap-6 px-6 py-7 lg:px-8">
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">
+                    Site under review
+                  </div>
+                  <h2 className="mt-2 truncate text-2xl font-semibold tracking-tight text-slate-900">
+                    {project?.domain ?? `Project #${projectId}`}
+                  </h2>
+                  <p className="mt-2 max-w-xl text-sm leading-relaxed text-slate-500">
+                    Ranked category health, severity mix, and score trends for this crawl run.
+                    Fix urgent issues first, then lift the weakest categories.
+                  </p>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <KpiTile
+                    icon={FileSearch}
+                    label="Pages crawled"
+                    value={String(summary.total_pages)}
+                    hint="Indexed in this run"
+                  />
+                  <KpiTile
+                    icon={ListChecks}
+                    label="Total issues"
+                    value={String(totalIssues)}
+                    hint="Across all severities"
+                  />
+                  <KpiTile
+                    icon={AlertTriangle}
+                    label="Urgent"
+                    value={String(urgentIssues)}
+                    hint="Critical + high"
+                    accent="text-orange-600"
+                  />
+                  <KpiTile
+                    icon={Layers}
+                    label="Weakest area"
+                    value={weakest ? String(weakest.score) : "—"}
+                    hint={weakest ? weakest.label : "No scores yet"}
+                    accent={weakest ? undefined : "text-slate-900"}
+                    valueColor={weakest?.fill}
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <div className="grid gap-6 xl:grid-cols-12">
+            {/* Severity analysis */}
+            <Card className="xl:col-span-5">
+              <CardHeader className="flex flex-row items-center justify-between gap-3">
+                <div>
+                  <CardTitle>Severity mix</CardTitle>
+                  <p className="mt-1 text-xs text-slate-500">Issue volume by priority</p>
+                </div>
+                <Link
+                  to="/issues"
+                  className="inline-flex items-center gap-1 text-sm font-semibold text-brand-700 hover:underline"
+                >
+                  Open issues <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </CardHeader>
-              <CardContent>
-                <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  {severityData.map((row) => (
-                    <div key={row.severity} className="rounded-lg border border-gray-100 px-4 py-3">
-                      <div className="text-xs font-medium uppercase tracking-wide text-gray-500">
-                        {row.severity}
-                      </div>
-                      <div className="mt-1 text-2xl font-bold tabular-nums" style={{ color: row.fill }}>
-                        {row.count}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div className="h-52">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={severityData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                      <XAxis dataKey="severity" tick={{ fontSize: 12 }} />
-                      <YAxis allowDecimals={false} tick={{ fontSize: 12 }} width={36} />
-                      <Tooltip
-                        formatter={(value) => [value ?? 0, "Issues"]}
-                        contentStyle={{ borderRadius: 8, borderColor: "#e5e7eb" }}
-                      />
-                      <Bar dataKey="count" radius={[6, 6, 0, 0]}>
-                        {severityData.map((row) => (
-                          <Cell key={row.severity} fill={row.fill} />
+              <CardContent className="space-y-5">
+                {totalIssues === 0 ? (
+                  <p className="py-8 text-center text-sm text-slate-500">No issues found for this run.</p>
+                ) : (
+                  <>
+                    <div className="flex h-3 overflow-hidden rounded-full bg-slate-100">
+                      {severityData
+                        .filter((row) => row.count > 0)
+                        .map((row) => (
+                          <div
+                            key={row.severity}
+                            className="h-full first:rounded-l-full last:rounded-r-full"
+                            style={{
+                              width: `${(row.count / totalIssues) * 100}%`,
+                              backgroundColor: row.fill,
+                            }}
+                            title={`${row.severity}: ${row.count}`}
+                          />
                         ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
+                    </div>
+                    <div className="space-y-3">
+                      {severityData.map((row) => {
+                        const pct = totalIssues ? Math.round((row.count / totalIssues) * 100) : 0;
+                        return (
+                          <div key={row.severity} className="flex items-center gap-3">
+                            <span
+                              className="h-2.5 w-2.5 shrink-0 rounded-full"
+                              style={{ backgroundColor: row.fill }}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center justify-between gap-2 text-sm">
+                                <span className="font-medium capitalize text-slate-700">
+                                  {row.severity}
+                                </span>
+                                <span className="tabular-nums text-slate-500">
+                                  {row.count} · {pct}%
+                                </span>
+                              </div>
+                              <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                                <div
+                                  className="h-full rounded-full"
+                                  style={{ width: `${pct}%`, backgroundColor: row.fill }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
               </CardContent>
             </Card>
-          </div>
 
-          <div>
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-gray-900">Category scores</h2>
-            </div>
-            {categoryData.length === 0 ? (
-              <Card>
-                <CardContent className="py-8 text-sm text-gray-500">No category scores yet.</CardContent>
-              </Card>
-            ) : (
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {categoryData.map((row) => (
-                  <Card key={row.category}>
-                    <CardContent className="flex items-center gap-4 py-5">
-                      <div
-                        className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl text-xl font-bold text-white"
-                        style={{ backgroundColor: row.fill }}
-                      >
-                        {row.score}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-semibold capitalize text-gray-900">
-                          {row.label}
-                        </div>
-                        <div className="mt-2 h-2 overflow-hidden rounded-full bg-gray-100">
-                          <div
-                            className="h-full rounded-full transition-all"
-                            style={{ width: `${row.score}%`, backgroundColor: row.fill }}
-                          />
-                        </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {categoryData.length > 0 ? (
-            <Card>
-              <CardHeader>
-                <CardTitle>Category comparison</CardTitle>
+            {/* Category ranking */}
+            <Card className="xl:col-span-7">
+              <CardHeader className="flex flex-row items-start justify-between gap-3">
+                <div>
+                  <CardTitle>Category health ranking</CardTitle>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Sorted weakest → strongest · colors scale within this audit
+                  </p>
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-2 w-2 rounded-full bg-red-500" /> Focus
+                    </span>
+                    <span className="text-slate-300">→</span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-2 w-2 rounded-full bg-amber-500" /> Mid
+                    </span>
+                    <span className="text-slate-300">→</span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-2 w-2 rounded-full bg-sky-500" /> Strong
+                    </span>
+                    <span className="text-slate-300">→</span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-2 w-2 rounded-full bg-emerald-500" /> Best
+                    </span>
+                  </div>
+                </div>
+                {strongest ? (
+                  <div className="rounded-xl bg-emerald-50 px-3 py-2 text-right ring-1 ring-inset ring-emerald-100">
+                    <div className="text-[10px] font-semibold uppercase tracking-wider text-emerald-600">
+                      Strongest
+                    </div>
+                    <div className="mt-0.5 text-sm font-semibold capitalize text-emerald-800">
+                      {strongest.label} · {strongest.score}
+                    </div>
+                  </div>
+                ) : null}
               </CardHeader>
               <CardContent>
-                <div className="h-72">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart
-                      data={categoryData}
-                      layout="vertical"
-                      margin={{ top: 8, right: 24, left: 8, bottom: 8 }}
-                    >
-                      <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 12 }} />
-                      <YAxis
-                        type="category"
-                        dataKey="label"
-                        width={120}
-                        tick={{ fontSize: 12 }}
-                        className="capitalize"
-                      />
-                      <Tooltip
-                        formatter={(value) => [value ?? 0, "Score"]}
-                        contentStyle={{ borderRadius: 8, borderColor: "#e5e7eb" }}
-                      />
-                      <Bar dataKey="score" radius={[0, 6, 6, 0]} barSize={18}>
-                        {categoryData.map((row) => (
-                          <Cell key={row.category} fill={row.fill} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
+                {categoryData.length === 0 ? (
+                  <p className="py-8 text-center text-sm text-slate-500">No category scores yet.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {categoryData.map((row) => (
+                      <div
+                        key={row.category}
+                        className="flex items-center gap-3 rounded-2xl px-3 py-3 ring-1 ring-inset"
+                        style={{
+                          backgroundColor: `${row.fill}14`,
+                          // ring via boxShadow so dynamic color works without Tailwind
+                          boxShadow: `inset 0 0 0 1px ${row.fill}33`,
+                        }}
+                      >
+                        <div
+                          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-xs font-bold tabular-nums text-white"
+                          style={{ backgroundColor: row.fill }}
+                        >
+                          {row.rank}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="truncate text-sm font-semibold capitalize text-slate-900">
+                                {row.label}
+                              </span>
+                              {row.isFocus ? (
+                                <span className="shrink-0 rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-700 ring-1 ring-orange-200">
+                                  Focus
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="flex shrink-0 items-baseline gap-2">
+                              {row.gapFromBest > 0 ? (
+                                <span className="text-[11px] font-medium tabular-nums text-slate-500">
+                                  −{row.gapFromBest} vs best
+                                </span>
+                              ) : (
+                                <span className="text-[11px] font-medium text-emerald-600">Best</span>
+                              )}
+                              <span
+                                className="text-base font-bold tabular-nums"
+                                style={{ color: row.fill }}
+                              >
+                                {row.score}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/80">
+                            <div
+                              className="h-full rounded-full transition-all"
+                              style={{ width: `${row.score}%`, backgroundColor: row.fill }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </CardContent>
             </Card>
-          ) : null}
+          </div>
 
+          {/* Trend */}
           <Card>
-            <CardHeader>
-              <CardTitle>Score over time</CardTitle>
+            <CardHeader className="flex flex-row items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <TrendingUp className="h-4 w-4 text-slate-400" />
+                  <CardTitle>Score over time</CardTitle>
+                </div>
+                <p className="mt-1 text-xs text-slate-500">
+                  Overall and category scores across previous audits for this project
+                </p>
+              </div>
+              {projectId ? (
+                <Link
+                  to={`/projects/${projectId}`}
+                  className="inline-flex items-center gap-1 text-sm font-semibold text-brand-700 hover:underline"
+                >
+                  Run history <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+              ) : null}
             </CardHeader>
             <CardContent>
               {historyChartData.length < 2 ? (
-                <p className="py-6 text-sm text-gray-500">
-                  {historyChartData.length === 1
-                    ? "Only one scored audit so far. Run another crawl to see trends."
-                    : "No scored audits yet for this project."}
-                </p>
+                <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-6 py-10 text-center">
+                  <p className="text-sm text-slate-600">
+                    {historyChartData.length === 1
+                      ? "Only one scored audit so far. Run another crawl to unlock trends."
+                      : "No scored audits yet for this project."}
+                  </p>
+                  <Link
+                    to="/audits/new"
+                    className="mt-4 inline-flex rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
+                  >
+                    Start another audit
+                  </Link>
+                </div>
               ) : (
                 <div className="h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={historyChartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                      <XAxis dataKey="label" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} width={36} />
+                      <CartesianGrid strokeDasharray="4 4" stroke="#e2e8f0" vertical={false} />
+                      <XAxis dataKey="label" tick={{ fontSize: 11, fill: "#64748b" }} axisLine={false} tickLine={false} />
+                      <YAxis
+                        domain={[0, 100]}
+                        tick={{ fontSize: 12, fill: "#64748b" }}
+                        width={36}
+                        axisLine={false}
+                        tickLine={false}
+                      />
                       <Tooltip
-                        contentStyle={{ borderRadius: 8, borderColor: "#e5e7eb" }}
+                        contentStyle={{
+                          borderRadius: 12,
+                          borderColor: "#e2e8f0",
+                          boxShadow: "0 8px 24px rgba(15,23,42,0.08)",
+                        }}
                         formatter={(value, name) => [
                           value == null ? "—" : Math.round(Number(value)),
                           name === "overall" ? "Overall" : labelCategory(String(name)),
@@ -379,8 +552,8 @@ export function DashboardPage() {
                         type="monotone"
                         dataKey="overall"
                         stroke={HISTORY_LINE_COLORS[0]}
-                        strokeWidth={2.5}
-                        dot={{ r: 3 }}
+                        strokeWidth={2.75}
+                        dot={{ r: 3.5, strokeWidth: 0 }}
                         connectNulls
                       />
                       {historyCategories.map((category, index) => (
@@ -389,8 +562,9 @@ export function DashboardPage() {
                           type="monotone"
                           dataKey={category}
                           stroke={HISTORY_LINE_COLORS[(index + 1) % HISTORY_LINE_COLORS.length]}
-                          strokeWidth={1.75}
-                          dot={{ r: 2 }}
+                          strokeWidth={1.6}
+                          strokeOpacity={0.85}
+                          dot={{ r: 2, strokeWidth: 0 }}
                           connectNulls
                         />
                       ))}
@@ -400,16 +574,48 @@ export function DashboardPage() {
               )}
             </CardContent>
           </Card>
-        </>
+        </div>
       ) : null}
 
       {!loading && !summary && !error && crawlRunId ? (
         <Card>
-          <CardContent className="py-8 text-sm text-gray-600">
+          <CardContent className="py-10 text-center text-sm text-slate-600">
             Summary is not available yet for this run{status ? ` (status: ${status})` : ""}.
           </CardContent>
         </Card>
       ) : null}
     </PageShell>
+  );
+}
+
+function KpiTile({
+  icon: Icon,
+  label,
+  value,
+  hint,
+  accent,
+  valueColor,
+}: {
+  icon: typeof FileSearch;
+  label: string;
+  value: string;
+  hint: string;
+  accent?: string;
+  valueColor?: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-200/80 bg-slate-50/80 px-4 py-3.5">
+      <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+        <Icon className="h-3.5 w-3.5" />
+        {label}
+      </div>
+      <div
+        className={`mt-2 text-2xl font-semibold tabular-nums tracking-tight ${accent ?? "text-slate-900"}`}
+        style={valueColor ? { color: valueColor } : undefined}
+      >
+        {value}
+      </div>
+      <div className="mt-0.5 truncate text-xs capitalize text-slate-500">{hint}</div>
+    </div>
   );
 }

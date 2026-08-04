@@ -23,15 +23,17 @@ export function StatusPill({ status }: { status: string }) {
   const key = status.toLowerCase();
   const className =
     key === "completed"
-      ? "bg-emerald-100 text-emerald-800"
+      ? "bg-emerald-50 text-emerald-700 ring-emerald-100"
       : key === "failed"
-        ? "bg-red-100 text-red-800"
+        ? "bg-red-50 text-red-700 ring-red-100"
         : key === "running" || key === "enriching"
-          ? "bg-sky-100 text-sky-800"
-          : "bg-amber-100 text-amber-800";
+          ? "bg-sky-50 text-sky-700 ring-sky-100"
+          : "bg-amber-50 text-amber-700 ring-amber-100";
 
   return (
-    <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${className}`}>
+    <span
+      className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold capitalize ring-1 ring-inset ${className}`}
+    >
       {status.replace(/_/g, " ")}
     </span>
   );

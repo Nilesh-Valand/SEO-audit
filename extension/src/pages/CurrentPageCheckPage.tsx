@@ -51,8 +51,10 @@ export function CurrentPageCheckPage() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Current Page Check</h1>
-          <p className="mt-1 text-sm text-gray-500">
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 lg:text-[1.75rem]">
+            Current Page Check
+          </h1>
+          <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
             Inspect SEO signals on the active browser tab — no backend required.
           </p>
         </div>
@@ -61,13 +63,13 @@ export function CurrentPageCheckPage() {
             type="button"
             onClick={() => void handleAnalyze()}
             disabled={loading}
-            className="rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
+            className="rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
           >
             {loading ? "Analyzing…" : "Analyze active tab"}
           </button>
           <Link
             to="/audits/new"
-            className="rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-sm font-semibold text-gray-800 hover:bg-gray-50"
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50"
           >
             Run full site audit instead
           </Link>

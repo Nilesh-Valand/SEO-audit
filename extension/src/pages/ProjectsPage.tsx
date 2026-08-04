@@ -96,14 +96,16 @@ function ProjectsListView() {
     <div className="mx-auto max-w-4xl space-y-6">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Projects</h1>
-          <p className="mt-1 text-sm text-gray-500">
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900 lg:text-[1.75rem]">
+            Projects
+          </h1>
+          <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
             Audited domains with latest crawl status and overall score.
           </p>
         </div>
         <Link
           to="/audits/new"
-          className="shrink-0 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700"
+          className="shrink-0 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
         >
           New Audit
         </Link>
@@ -144,7 +146,7 @@ function ProjectsListView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map(({ project, latestRun, overallScore }) => (
+                  {rows.map(({ project, latestRun, overallScore }, index) => (
                     <tr key={project.id} className="border-b border-gray-50 last:border-0">
                       <td className="px-6 py-4">
                         <Link
@@ -153,7 +155,7 @@ function ProjectsListView() {
                         >
                           {project.domain}
                         </Link>
-                        <div className="mt-0.5 text-xs text-gray-400">#{project.id}</div>
+                        <div className="mt-0.5 text-xs text-gray-400">#{index + 1}</div>
                       </td>
                       <td className="px-6 py-4">
                         {latestRun ? <StatusPill status={latestRun.status} /> : "—"}
@@ -261,7 +263,7 @@ function ProjectDetailView({ projectId }: { projectId: number }) {
 
   async function deleteRun(run: CrawlRun) {
     const ok = window.confirm(
-      `Delete crawl run #${run.id}? Issues, pages, and scores for this run will be removed.`,
+      `Delete this crawl run? Issues, pages, and scores for this run will be removed.`,
     );
     if (!ok) return;
 
@@ -359,7 +361,7 @@ function ProjectDetailView({ projectId }: { projectId: number }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {runs.map((run) => {
+                  {runs.map((run, index) => {
                     const isSelected = selectedRunId === run.id;
                     return (
                       <tr
@@ -368,7 +370,7 @@ function ProjectDetailView({ projectId }: { projectId: number }) {
                           isSelected ? "bg-brand-50/60" : ""
                         }`}
                       >
-                        <td className="px-6 py-4 font-medium text-gray-900">#{run.id}</td>
+                        <td className="px-6 py-4 font-medium text-gray-900">#{index + 1}</td>
                         <td className="px-6 py-4">
                           <StatusPill status={run.status} />
                         </td>

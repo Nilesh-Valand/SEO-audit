@@ -40,7 +40,6 @@ export function NewAuditPage() {
   const [unreachable, setUnreachable] = useState(false);
 
   const [crawlRunId, setCrawlRunId] = useState<number | null>(null);
-  const [projectId, setProjectId] = useState<number | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [pagesCrawled, setPagesCrawled] = useState(0);
   const [activeMaxPages, setActiveMaxPages] = useState(50);
@@ -173,7 +172,6 @@ export function NewAuditPage() {
         enable_pagespeed: enablePagespeed,
       });
 
-      setProjectId(project.id);
       setCrawlRunId(created.crawl_run_id);
       startPolling(created.crawl_run_id, project.id);
     } catch (err) {
@@ -189,8 +187,8 @@ export function NewAuditPage() {
   return (
     <div className="mx-auto max-w-2xl space-y-6">
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">New Audit</h1>
-        <p className="mt-1 text-sm text-gray-500">
+        <h1 className="text-2xl font-semibold tracking-tight text-slate-900 lg:text-[1.75rem]">New Audit</h1>
+        <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
           Start a crawl against a domain. Progress updates while the backend runs.
         </p>
       </div>
@@ -260,7 +258,7 @@ export function NewAuditPage() {
             <button
               type="submit"
               disabled={submitting || polling}
-              className="rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700 disabled:opacity-60"
+              className="rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
             >
               {polling ? "Crawling…" : submitting ? "Starting…" : "Start audit"}
             </button>
@@ -282,8 +280,7 @@ export function NewAuditPage() {
               label={`${pagesCrawled} / ${activeMaxPages} pages crawled`}
             />
             <p className="text-xs text-gray-500">
-              Run #{crawlRunId}
-              {projectId ? ` · Project #${projectId}` : ""}
+              Crawl in progress
               {status === "enriching" ? " · Running sitemap checks & scoring…" : ""}
               {status === "completed" ? " · Complete — opening dashboard…" : ""}
             </p>

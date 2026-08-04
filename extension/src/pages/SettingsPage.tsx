@@ -42,8 +42,10 @@ export function SettingsPage() {
   return (
     <div className="mx-auto max-w-2xl space-y-6">
       <div>
-        <h1 className="text-3xl font-bold text-gray-900">Settings</h1>
-        <p className="mt-1 text-sm text-gray-500">
+        <h1 className="text-2xl font-semibold tracking-tight text-slate-900 lg:text-[1.75rem]">
+          Settings
+        </h1>
+        <p className="mt-1.5 text-sm leading-relaxed text-slate-500">
           Configure the FastAPI backend URL used by this extension.
         </p>
       </div>
@@ -55,9 +57,9 @@ export function SettingsPage() {
         <CardContent>
           <form onSubmit={handleSave} className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">API base URL</label>
+              <label className="text-sm font-medium text-slate-700">API base URL</label>
               <input
-                className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+                className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm outline-none transition focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
                 value={apiBase}
                 onChange={(event) => setApiBase(event.target.value)}
                 placeholder={DEFAULT_API_BASE_URL}
@@ -67,7 +69,7 @@ export function SettingsPage() {
             <div className="flex flex-wrap items-center gap-3">
               <button
                 type="submit"
-                className="rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-700"
+                className="rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700"
               >
                 Save
               </button>
@@ -75,7 +77,7 @@ export function SettingsPage() {
                 type="button"
                 onClick={() => void handleTest()}
                 disabled={testing}
-                className="rounded-lg border border-gray-300 bg-white px-4 py-2.5 text-sm font-semibold text-gray-800 hover:bg-gray-50 disabled:opacity-60"
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-60"
               >
                 {testing ? "Testing…" : "Test Connection"}
               </button>
