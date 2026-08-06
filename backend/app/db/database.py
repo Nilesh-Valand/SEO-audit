@@ -5,14 +5,18 @@ from app.config import settings
 
 engine = create_engine(
     settings.DB_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
 )
 
 
 @event.listens_for(engine, "connect")
-def set_wal_mode(dbapi_connection, connection_record):
+def set_sqlite_pragmas(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    # Fail locked readers/writers instead of hanging the asyncio event loop forever.
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
 

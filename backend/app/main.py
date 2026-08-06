@@ -59,7 +59,10 @@ if settings.allowed_origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-elif settings.ENV == "development":
+
+# Always reflect chrome-extension:// origins in development so unpacked IDs
+# keep working even when ALLOWED_ORIGINS lists a different extension ID.
+if settings.ENV == "development":
     app.add_middleware(ChromeExtensionCorsMiddleware)
 
 app.include_router(health_router, prefix="/api")

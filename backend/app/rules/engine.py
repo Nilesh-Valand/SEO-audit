@@ -15,18 +15,21 @@ from bs4 import BeautifulSoup
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, joinedload
 
+from app.checks import Scope, bind_registry, scope_for, severity_default_for
 from app.config import settings
-from app.rules.schema_validation import validate_schema_blocks
+from app.rules.schema_validation import schema_blocks_have_type, validate_schema_blocks
 from app.crawler.normalize import normalize_url
 from app.db.database import SessionLocal
 from app.models import (
-    AuditIssue,
+    CrawlPage,
     CrawledPage,
     CrawlRun,
     CrawlRunScore,
+    PageIssue,
     PageLink,
     PageTechnicalDetails,
     PageVital,
+    SiteIssue,
     SitemapFinding,
 )
 
@@ -121,60 +124,10 @@ class RuleEngine:
     def __init__(self, rules_path: str | Path | None = None) -> None:
         self.rules_path = Path(rules_path or Path(__file__).with_name("rules.yaml"))
         self.rules = self._load_rules()
+        # Registry is the single source of truth for check scope + run_fn binding.
+        self._registry = bind_registry(self)
         self._checks = {
-            "missing_title": self._missing_title,
-            "duplicate_title": self._duplicate_title,
-            "missing_meta_description": self._missing_meta_description,
-            "duplicate_meta_description": self._duplicate_meta_description,
-            "broken_link": self._broken_link,
-            "redirect_chain": self._redirect_chain,
-            "canonical_noindex_conflict": self._canonical_noindex_conflict,
-            "missing_canonical": self._missing_canonical,
-            "self_canonical_mismatch": self._self_canonical_mismatch,
-            "broken_canonical_url": self._broken_canonical_url,
-            "canonical_points_to_redirect": self._canonical_points_to_redirect,
-            "canonical_points_to_noindex": self._canonical_points_to_noindex,
-            "orphan_page": self._orphan_page,
-            "missing_h1": self._missing_h1,
-            "multiple_h1": self._multiple_h1,
-            "lcp_fail": self._lcp_fail,
-            "inp_fail": self._inp_fail,
-            "cls_fail": self._cls_fail,
-            "large_page_weight": self._large_page_weight,
-            "excessive_requests": self._excessive_requests,
-            "render_blocking_resources": self._render_blocking_resources,
-            "oversized_images": self._oversized_images,
-            "missing_image_dimensions": self._missing_image_dimensions,
-            "outdated_image_format": self._outdated_image_format,
-            "slow_ttfb": self._slow_ttfb,
-            "thin_content": self._thin_content,
-            "duplicate_content": self._duplicate_content,
-            "missing_schema": self._missing_schema,
-            "mixed_content": self._mixed_content,
-            "sitemap_orphan": self._sitemap_orphan,
-            "crawled_not_in_sitemap": self._crawled_not_in_sitemap,
-            "uppercase_url": self._uppercase_url,
-            "underscore_in_url": self._underscore_in_url,
-            "excessive_url_length": self._excessive_url_length,
-            "unnecessary_url_parameters": self._unnecessary_url_parameters,
-            "redirect_loop": self._redirect_loop,
-            "temp_redirect_should_be_permanent": self._temp_redirect_should_be_permanent,
-            "robots_txt_syntax_error": self._robots_txt_syntax_error,
-            "robots_txt_missing": self._robots_txt_missing,
-            "ai_crawler_blocked": self._ai_crawler_blocked,
-            "llms_txt_missing": self._llms_txt_missing,
-            "answer_first_heuristic": self._answer_first_heuristic,
-            "sitemap_not_found": self._sitemap_not_found,
-            "sitemap_malformed": self._sitemap_malformed,
-            "sitemap_child_broken": self._sitemap_child_broken,
-            "missing_og_tags": self._missing_og_tags,
-            "missing_twitter_card": self._missing_twitter_card,
-            "missing_html_lang": self._missing_html_lang,
-            "missing_favicon": self._missing_favicon,
-            "generic_404_page": self._generic_404_page,
-            "schema_invalid": self._schema_invalid,
-            "keyword_cannibalization": self._keyword_cannibalization,
-            "poor_content_structure": self._poor_content_structure,
+            name: entry.run_fn for name, entry in self._registry.items() if entry.run_fn is not None
         }
         self._current_crawl_run: CrawlRun | None = None
         self._canonical_probe_cache: dict[str, CanonicalTargetProbe] = {}
@@ -189,36 +142,72 @@ class RuleEngine:
 
             self._purge_duplicate_pages(db, crawl_run_id)
             page_contexts = self._load_page_contexts(db, crawl_run_id)
-            findings = db.scalars(
-                select(SitemapFinding).where(SitemapFinding.crawl_run_id == crawl_run_id)
-            ).all()
 
-            db.execute(delete(AuditIssue).where(AuditIssue.crawl_run_id == crawl_run_id))
-            db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_run_id == crawl_run_id))
+            # Scoped runners own issue persistence — only recompute scores here.
+            db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_id == crawl_run_id))
 
             self._current_crawl_run = crawl_run
             self._canonical_probe_cache.clear()
             issues: list[IssueRecord] = []
             try:
                 for rule in self.rules:
+                    check_scope = scope_for(rule.id) or scope_for(rule.condition)
+                    # SITE / PAGE / CROSS_PAGE / HOMEPAGE are owned by check runners.
+                    if check_scope in {
+                        Scope.SITE,
+                        Scope.PAGE,
+                        Scope.CROSS_PAGE,
+                        Scope.HOMEPAGE,
+                    }:
+                        continue
                     check = self._checks.get(rule.condition)
                     if check is None:
                         continue
-                    issues.extend(check(rule, crawl_run_id, page_contexts, findings))
+                    issues.extend(check(rule, crawl_run_id, page_contexts, []))
             finally:
                 self._current_crawl_run = None
                 self._canonical_probe_cache.clear()
 
-            for issue in issues:
-                db.add(
-                    AuditIssue(
-                        crawl_run_id=issue.crawl_run_id,
-                        crawled_page_id=issue.crawled_page_id,
-                        rule_id=issue.rule_id,
-                        category=issue.category,
-                        severity=issue.severity,
-                        target_url=issue.target_url,
-                        message=issue.message,
+            # Include failing site_issues + page_issues in category scores.
+            rules_by_id = {rule.id: rule for rule in self.rules}
+            site_fails = db.scalars(
+                select(SiteIssue).where(
+                    SiteIssue.crawl_id == crawl_run_id,
+                    SiteIssue.status == "fail",
+                )
+            ).all()
+            for row in site_fails:
+                rule = rules_by_id.get(row.check_name)
+                issues.append(
+                    IssueRecord(
+                        crawl_run_id=crawl_run_id,
+                        crawled_page_id=None,
+                        target_url=None,
+                        rule_id=row.check_name,
+                        category=rule.category if rule else "technical",
+                        severity=row.severity,
+                        message=row.details,
+                    )
+                )
+
+            page_fails = db.scalars(
+                select(PageIssue).where(
+                    PageIssue.crawl_id == crawl_run_id,
+                    PageIssue.status == "fail",
+                )
+            ).all()
+            page_id_by_url = {ctx.normalized_url: ctx.page.id for ctx in page_contexts}
+            for row in page_fails:
+                rule = rules_by_id.get(row.check_name)
+                issues.append(
+                    IssueRecord(
+                        crawl_run_id=crawl_run_id,
+                        crawled_page_id=page_id_by_url.get(normalize_url(row.url)),
+                        target_url=row.url,
+                        rule_id=row.check_name,
+                        category=rule.category if rule else "technical",
+                        severity=row.severity,
+                        message=row.details,
                     )
                 )
 
@@ -226,7 +215,7 @@ class RuleEngine:
             for category, score in scores.items():
                 db.add(
                     CrawlRunScore(
-                        crawl_run_id=crawl_run_id,
+                        crawl_id=crawl_run_id,
                         category=category,
                         score=score,
                     )
@@ -237,18 +226,35 @@ class RuleEngine:
 
     def _load_rules(self) -> list[RuleDefinition]:
         payload = yaml.safe_load(self.rules_path.read_text(encoding="utf-8")) or []
-        return [RuleDefinition(**item) for item in payload]
+        rules: list[RuleDefinition] = []
+        for item in payload:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            rule_id = str(item["id"])
+            # Registry severity_default wins when the check is registered.
+            severity = severity_default_for(rule_id) or str(item.get("severity") or "medium")
+            rules.append(
+                RuleDefinition(
+                    id=rule_id,
+                    category=str(item.get("category") or "technical"),
+                    description=str(item.get("description") or ""),
+                    severity=severity,
+                    condition=str(item.get("condition") or rule_id),
+                )
+            )
+        return rules
 
     def _purge_duplicate_pages(self, db: Session, crawl_run_id: int) -> int:
         """Remove extra crawled_page rows that share the same canonical URL."""
         pages = db.scalars(
             select(CrawledPage)
-            .where(CrawledPage.crawl_run_id == crawl_run_id)
+            .where(CrawledPage.crawl_id == crawl_run_id)
             .order_by(CrawledPage.id.asc())
         ).all()
 
         keep_count = 0
         delete_ids: list[int] = []
+        deleted_urls: list[str] = []
         seen: set[str] = set()
         for page in pages:
             key = self._normalize_url(page.url)
@@ -256,19 +262,26 @@ class RuleEngine:
                 page.url = key
             if key in seen:
                 delete_ids.append(page.id)
+                deleted_urls.append(page.url)
                 continue
             seen.add(key)
             keep_count += 1
 
         if delete_ids:
-            db.execute(delete(PageLink).where(PageLink.crawled_page_id.in_(delete_ids)))
-            db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(delete_ids)))
+            db.execute(delete(PageLink).where(PageLink.crawl_page_id.in_(delete_ids)))
+            db.execute(delete(PageVital).where(PageVital.crawl_page_id.in_(delete_ids)))
             db.execute(
                 delete(PageTechnicalDetails).where(
-                    PageTechnicalDetails.crawled_page_id.in_(delete_ids)
+                    PageTechnicalDetails.crawl_page_id.in_(delete_ids)
                 )
             )
-            db.execute(delete(AuditIssue).where(AuditIssue.crawled_page_id.in_(delete_ids)))
+            if deleted_urls:
+                db.execute(
+                    delete(PageIssue).where(
+                        PageIssue.crawl_id == crawl_run_id,
+                        PageIssue.url.in_(deleted_urls),
+                    )
+                )
             db.execute(delete(CrawledPage).where(CrawledPage.id.in_(delete_ids)))
 
         crawl_run = db.get(CrawlRun, crawl_run_id)
@@ -280,7 +293,7 @@ class RuleEngine:
     def _load_page_contexts(self, db: Session, crawl_run_id: int) -> list[PageContext]:
         pages = db.scalars(
             select(CrawledPage)
-            .where(CrawledPage.crawl_run_id == crawl_run_id)
+            .where(CrawledPage.crawl_id == crawl_run_id)
             .options(
                 joinedload(CrawledPage.page_vitals),
                 joinedload(CrawledPage.technical_details),
@@ -301,7 +314,7 @@ class RuleEngine:
         normalized_to_page = {self._normalize_url(page.url): page for page in deduped_pages}
         inbound_links = defaultdict(int)
         links = db.scalars(
-            select(PageLink).join(CrawledPage).where(CrawledPage.crawl_run_id == crawl_run_id)
+            select(PageLink).join(CrawledPage).where(CrawledPage.crawl_id == crawl_run_id)
         ).all()
         for link in links:
             if not link.is_internal:
@@ -316,6 +329,8 @@ class RuleEngine:
             h1_count, h2_count, h3_count, text_hash, mixed_content = self._snapshot_signals(
                 page.raw_html_path, page.url
             )
+            if h1_count == 0 and page.h1_list:
+                h1_count = len(page.h1_list)
             vitals = {vital.strategy: vital for vital in page.page_vitals}
             contexts.append(
                 PageContext(
@@ -1002,14 +1017,16 @@ class RuleEngine:
             if finding.finding_type != "crawled_not_in_sitemap":
                 continue
             page = by_url.get(self._normalize_url(finding.url))
-            if page is None:
-                continue
+            target = page.page.url if page is not None else finding.url
             issues.append(
-                self._page_issue(
-                    rule,
-                    crawl_run_id,
-                    page,
-                    "Crawled URL does not appear in the sitemap.",
+                IssueRecord(
+                    crawl_run_id=crawl_run_id,
+                    crawled_page_id=None,
+                    target_url=target,
+                    rule_id=rule.id,
+                    category=rule.category,
+                    severity=rule.severity,
+                    message="Crawled URL does not appear in the sitemap.",
                 )
             )
         return issues
@@ -1112,11 +1129,14 @@ class RuleEngine:
                 seen.add(normalized)
             if looped:
                 issues.append(
-                    self._page_issue(
-                        rule,
-                        crawl_run_id,
-                        page,
-                        "Redirect chain contains a loop (a URL redirects back to a previously seen URL).",
+                    IssueRecord(
+                        crawl_run_id=crawl_run_id,
+                        crawled_page_id=None,
+                        target_url=page.page.url,
+                        rule_id=rule.id,
+                        category=rule.category,
+                        severity=rule.severity,
+                        message="Redirect chain contains a loop (a URL redirects back to a previously seen URL).",
                     )
                 )
         return issues
@@ -1408,11 +1428,49 @@ class RuleEngine:
                 rule,
                 crawl_run_id,
                 page,
-                "No favicon was detected (link rel=icon or /favicon.ico).",
+                "No favicon was detected on the homepage (link rel=icon or /favicon.ico).",
             )
-            for page in pages
+            for page in self._homepage_contexts(pages)
             if page.technical is not None and not page.technical.favicon_present
         ]
+
+    def _organization_schema(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in self._homepage_contexts(pages):
+            tech = page.technical
+            blocks = tech.schema_json if tech is not None else None
+            if isinstance(blocks, list) and schema_blocks_have_type(blocks, "Organization"):
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "Homepage is missing Organization JSON-LD schema.",
+                )
+            )
+        return issues
+
+    def _website_schema(
+        self, rule: RuleDefinition, crawl_run_id: int, pages: list[PageContext], _: list[SitemapFinding]
+    ) -> list[IssueRecord]:
+        issues: list[IssueRecord] = []
+        for page in self._homepage_contexts(pages):
+            tech = page.technical
+            blocks = tech.schema_json if tech is not None else None
+            if isinstance(blocks, list) and schema_blocks_have_type(blocks, "WebSite"):
+                continue
+            issues.append(
+                self._page_issue(
+                    rule,
+                    crawl_run_id,
+                    page,
+                    "Homepage is missing WebSite JSON-LD schema.",
+                )
+            )
+        return issues
 
     def _generic_404_page(
         self, rule: RuleDefinition, crawl_run_id: int, _: list[PageContext], __: list[SitemapFinding]
@@ -1675,6 +1733,43 @@ class RuleEngine:
                     )
                 )
         return issues
+
+    def _homepage_contexts(self, pages: list[PageContext]) -> list[PageContext]:
+        """Return pages that are the site homepage (HOMEPAGE-scoped checks only)."""
+        crawl = self._current_crawl_run
+        domain = ""
+        if crawl is not None and crawl.domain:
+            domain = crawl.domain.lower().removeprefix("www.")
+
+        matches: list[PageContext] = []
+        for page in pages:
+            parsed = urlparse(page.page.url)
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+            path = parsed.path or "/"
+            if domain and host != domain:
+                continue
+            if path in {"", "/"} and not parsed.query:
+                matches.append(page)
+
+        if matches:
+            return matches
+
+        # Fallback: shortest path on the crawl domain (or overall if domain unknown).
+        candidates = pages
+        if domain:
+            candidates = [
+                page
+                for page in pages
+                if (urlparse(page.page.url).hostname or "").lower().removeprefix("www.") == domain
+            ] or pages
+        if not candidates:
+            return []
+        return [
+            min(
+                candidates,
+                key=lambda page: (len(urlparse(page.page.url).path or "/"), len(page.page.url)),
+            )
+        ]
 
     def _page_issue(
         self,

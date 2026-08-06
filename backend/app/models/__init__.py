@@ -1,8 +1,9 @@
 from app.models.project import Project
-from app.models.crawl_run import CrawlRun
-from app.models.crawled_page import CrawledPage
+from app.models.crawl import Crawl, CrawlRun
+from app.models.crawl_page import CrawlPage, CrawledPage
 from app.models.page_link import PageLink
-from app.models.audit_issue import AuditIssue
+from app.models.site_issue import SiteIssue
+from app.models.page_issue import PageIssue
 from app.models.crawl_run_score import CrawlRunScore
 from app.models.page_vital import PageVital
 from app.models.sitemap_finding import SitemapFinding
@@ -10,10 +11,13 @@ from app.models.page_technical_details import PageTechnicalDetails
 
 __all__ = [
     "Project",
+    "Crawl",
     "CrawlRun",
+    "CrawlPage",
     "CrawledPage",
     "PageLink",
-    "AuditIssue",
+    "SiteIssue",
+    "PageIssue",
     "CrawlRunScore",
     "PageVital",
     "SitemapFinding",

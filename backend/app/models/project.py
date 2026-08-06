@@ -14,6 +14,11 @@ class Project(Base):
         DateTime, default=func.now(), nullable=False
     )
 
-    crawl_runs: Mapped[list["CrawlRun"]] = relationship(  # noqa: F821
+    crawls: Mapped[list["Crawl"]] = relationship(  # noqa: F821
         back_populates="project", cascade="all, delete-orphan"
     )
+
+    # Back-compat alias for older code paths.
+    @property
+    def crawl_runs(self) -> list:
+        return self.crawls

@@ -7,15 +7,15 @@ import os
 import tempfile
 from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import joinedload
+from sqlalchemy import select
 
 from app.db.database import SessionLocal
-from app.models import AuditIssue, CrawlRun, CrawlRunScore, Project
+from app.models import CrawlRun, CrawlRunScore, Project
+from app.rules.engine import RuleEngine
 from app.rules.recommendations import recommendation_for_rule
+from app.services.issues import load_issue_views
 
 # Same weights as RuleEngine scoring: impact = weight × pages affected.
 SEVERITY_WEIGHTS = {
@@ -27,6 +27,9 @@ SEVERITY_WEIGHTS = {
 
 
 class ReportService:
+    def __init__(self) -> None:
+        self._rules_by_id = {rule.id: rule for rule in RuleEngine().rules}
+
     def build_report(self, crawl_run_id: int) -> dict[str, Any]:
         with SessionLocal() as db:
             crawl_run = db.get(CrawlRun, crawl_run_id)
@@ -36,45 +39,96 @@ class ReportService:
             project = db.get(Project, crawl_run.project_id)
             scores = db.scalars(
                 select(CrawlRunScore)
-                .where(CrawlRunScore.crawl_run_id == crawl_run_id)
+                .where(CrawlRunScore.crawl_id == crawl_run_id)
                 .order_by(CrawlRunScore.category.asc())
             ).all()
-            issues = db.scalars(
-                select(AuditIssue)
-                .where(AuditIssue.crawl_run_id == crawl_run_id)
-                .options(joinedload(AuditIssue.crawled_page))
-                .order_by(AuditIssue.category.asc(), AuditIssue.id.asc())
-            ).all()
+            issues = load_issue_views(db, crawl_run_id, rules_by_id=self._rules_by_id)
+            issues.sort(key=lambda item: (item.category, item.id))
 
-            category_scores = {score.category: score.score for score in scores if score.category != "overall"}
-            overall_score = next((score.score for score in scores if score.category == "overall"), None)
+            category_scores = {
+                score.category: score.score for score in scores if score.category != "overall"
+            }
+            overall_score = next(
+                (score.score for score in scores if score.category == "overall"), None
+            )
 
             severity_counts = {severity: 0 for severity in ("critical", "high", "medium", "low")}
             category_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
             recommendation_groups: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+            # Site issues: one row each from site_issues — never fan out per page.
+            site_issues: list[dict[str, Any]] = []
+            # Page issues: group only that URL's page_issues rows.
+            page_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
             for issue in issues:
                 severity_counts[issue.severity] = severity_counts.get(issue.severity, 0) + 1
-                url = issue.target_url or (issue.crawled_page.url if issue.crawled_page else None)
-                category_groups[issue.category].append(
-                    {
-                        "url": url,
-                        "rule": issue.rule_id,
-                        "severity": issue.severity,
-                        "message": issue.message,
-                    }
-                )
+                is_site = issue.scope != "page"
 
-                recommendation_key = (issue.rule_id, issue.severity, issue.category)
+                payload = {
+                    "id": issue.id,
+                    "rule": issue.check_name,
+                    "severity": issue.severity,
+                    "category": issue.category,
+                    "message": issue.details,
+                    "scope": issue.scope,
+                }
+
+                if is_site:
+                    site_issues.append(payload)
+                    # Category inventory keeps site findings URL-less (no per-page dupes).
+                    category_groups[issue.category].append(
+                        {
+                            "url": None,
+                            "rule": issue.check_name,
+                            "severity": issue.severity,
+                            "message": issue.details,
+                            "scope": issue.scope,
+                        }
+                    )
+                else:
+                    url = issue.url or ""
+                    page_groups[url].append(payload)
+                    category_groups[issue.category].append(
+                        {
+                            "url": issue.url,
+                            "rule": issue.check_name,
+                            "severity": issue.severity,
+                            "message": issue.details,
+                            "scope": "page",
+                        }
+                    )
+
+                recommendation_key = (issue.check_name, issue.severity, issue.category)
                 if recommendation_key not in recommendation_groups:
                     recommendation_groups[recommendation_key] = {
-                        "rule": issue.rule_id,
+                        "rule": issue.check_name,
                         "severity": issue.severity,
                         "category": issue.category,
-                        "message": recommendation_for_rule(issue.rule_id, issue.message),
+                        "message": recommendation_for_rule(issue.check_name, issue.details),
                         "pages_affected": 0,
                     }
+                # Site findings count once; page findings count once per affected URL row.
                 recommendation_groups[recommendation_key]["pages_affected"] += 1
+
+            page_issues = [
+                {
+                    "url": url,
+                    "issue_count": len(rows),
+                    "issues": rows,
+                }
+                for url, rows in sorted(page_groups.items(), key=lambda item: item[0])
+            ]
+
+            site_issue_count = len(site_issues)
+            pages_with_issues = len(page_issues)
+            page_issue_count = sum(group["issue_count"] for group in page_issues)
+            summary_text = (
+                f"{site_issue_count} site issue{'s' if site_issue_count != 1 else ''}, "
+                f"{pages_with_issues} page{'s' if pages_with_issues != 1 else ''} with issues, "
+                f"{page_issue_count} total page-level finding"
+                f"{'s' if page_issue_count != 1 else ''}."
+            )
 
             categories = [
                 {
@@ -112,9 +166,15 @@ class ReportService:
                 "category_scores": category_scores,
                 "summary": {
                     "total_pages": crawl_run.total_urls,
-                    "total_issues": len(issues),
+                    "total_issues": site_issue_count + page_issue_count,
+                    "site_issue_count": site_issue_count,
+                    "pages_with_issues": pages_with_issues,
+                    "page_issue_count": page_issue_count,
+                    "summary_text": summary_text,
                     "issues_by_severity": severity_counts,
                 },
+                "site_issues": site_issues,
+                "page_issues": page_issues,
                 "categories": categories,
                 "recommendations": recommendations,
             }
@@ -127,24 +187,33 @@ class ReportService:
 
             buffer = io.StringIO()
             writer = csv.writer(buffer)
-            writer.writerow(["url", "category", "rule", "severity", "message"])
+            writer.writerow(["section", "url", "category", "rule", "severity", "message", "scope"])
             yield buffer.getvalue()
             buffer.seek(0)
             buffer.truncate(0)
 
-            rows = db.execute(
-                select(
-                    AuditIssue.target_url,
-                    AuditIssue.category,
-                    AuditIssue.rule_id,
-                    AuditIssue.severity,
-                    AuditIssue.message,
+            issues = load_issue_views(db, crawl_run_id, rules_by_id=self._rules_by_id)
+            issues.sort(
+                key=lambda item: (
+                    0 if item.scope != "page" else 1,
+                    item.url or "",
+                    item.category,
+                    item.id,
                 )
-                .where(AuditIssue.crawl_run_id == crawl_run_id)
-                .order_by(AuditIssue.category.asc(), AuditIssue.id.asc())
             )
-            for row in rows:
-                writer.writerow([row.target_url or "", row.category, row.rule_id, row.severity, row.message])
+            for issue in issues:
+                is_site = issue.scope != "page"
+                writer.writerow(
+                    [
+                        "site" if is_site else "page",
+                        "" if is_site else (issue.url or ""),
+                        issue.category,
+                        issue.check_name,
+                        issue.severity,
+                        issue.details,
+                        issue.scope,
+                    ]
+                )
                 yield buffer.getvalue()
                 buffer.seek(0)
                 buffer.truncate(0)
@@ -240,7 +309,20 @@ class ReportService:
         severity = summary.get("issues_by_severity") or {}
         summary_data = [
             ["Total pages", str(summary.get("total_pages", 0))],
-            ["Total issues", str(summary.get("total_issues", 0))],
+            [
+                "Issue summary",
+                str(
+                    summary.get("summary_text")
+                    or (
+                        f"{summary.get('site_issue_count', 0)} site issues, "
+                        f"{summary.get('pages_with_issues', 0)} pages with issues, "
+                        f"{summary.get('page_issue_count', 0)} total page-level findings."
+                    )
+                ),
+            ],
+            ["Site issues", str(summary.get("site_issue_count", 0))],
+            ["Pages with issues", str(summary.get("pages_with_issues", 0))],
+            ["Page-level findings", str(summary.get("page_issue_count", 0))],
             ["Critical", str(severity.get("critical", 0))],
             ["High", str(severity.get("high", 0))],
             ["Medium", str(severity.get("medium", 0))],
@@ -311,28 +393,34 @@ class ReportService:
                 )
                 story.append(Spacer(1, 4))
 
-        for category in report.get("categories") or []:
-            story.append(PageBreak())
-            score = category.get("score")
-            score_label = f" — Score {score}" if score is not None else ""
-            story.append(Paragraph(f"{safe(category.get('name'))}{score_label}", heading_style))
-            issues = category.get("issues") or []
-            if not issues:
-                story.append(Paragraph("No issues in this category.", body_style))
-                continue
-
-            rows = [["Severity", "Rule", "URL", "Message"]]
-            for issue in issues[:200]:
+        # --- Site Issues (one row each; never duplicated per page) ---
+        story.append(PageBreak())
+        story.append(Paragraph("Site Issues", heading_style))
+        story.append(
+            Paragraph(
+                "One row per site-level finding (robots, sitemap, cross-page, homepage). "
+                "These are not repeated under individual pages.",
+                body_style,
+            )
+        )
+        site_issues = report.get("site_issues") or []
+        if not site_issues:
+            story.append(Paragraph("No site issues for this run.", body_style))
+        else:
+            rows = [["Severity", "Scope", "Rule", "Message"]]
+            for issue in site_issues[:300]:
                 rows.append(
                     [
                         Paragraph(safe(issue.get("severity")), small_style),
+                        Paragraph(safe(issue.get("scope")), small_style),
                         Paragraph(safe(issue.get("rule")), small_style),
-                        Paragraph(safe(issue.get("url") or "—"), small_style),
                         Paragraph(safe(issue.get("message")), small_style),
                     ]
                 )
-            issue_table = Table(rows, colWidths=[0.85 * inch, 1.2 * inch, 2.1 * inch, 2.35 * inch])
-            issue_table.setStyle(
+            site_table = Table(
+                rows, colWidths=[0.85 * inch, 0.95 * inch, 1.4 * inch, 3.3 * inch]
+            )
+            site_table.setStyle(
                 TableStyle(
                     [
                         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
@@ -345,15 +433,72 @@ class ReportService:
                         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                         ("TOPPADDING", (0, 0), (-1, -1), 4),
                         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9fafb")]),
+                        (
+                            "ROWBACKGROUNDS",
+                            (0, 1),
+                            (-1, -1),
+                            [colors.white, colors.HexColor("#f9fafb")],
+                        ),
                     ]
                 )
             )
-            story.append(issue_table)
-            if len(issues) > 200:
+            story.append(site_table)
+
+        # --- Page Issues (grouped by URL) ---
+        story.append(PageBreak())
+        story.append(Paragraph("Page Issues", heading_style))
+        story.append(
+            Paragraph(
+                "Findings from page_issues, grouped by URL. Only that page's rows are listed.",
+                body_style,
+            )
+        )
+        page_groups = report.get("page_issues") or []
+        if not page_groups:
+            story.append(Paragraph("No page-level issues for this run.", body_style))
+        else:
+            for group in page_groups[:150]:
+                url = safe(group.get("url") or "—")
+                count = group.get("issue_count") or len(group.get("issues") or [])
                 story.append(
-                    Paragraph(f"Showing first 200 of {len(issues)} issues in this category.", small_style)
+                    Paragraph(f"<b>{url}</b> — {count} finding(s)", body_style)
                 )
+                rows = [["Severity", "Rule", "Message"]]
+                for issue in (group.get("issues") or [])[:80]:
+                    rows.append(
+                        [
+                            Paragraph(safe(issue.get("severity")), small_style),
+                            Paragraph(safe(issue.get("rule")), small_style),
+                            Paragraph(safe(issue.get("message")), small_style),
+                        ]
+                    )
+                page_table = Table(
+                    rows, colWidths=[0.85 * inch, 1.5 * inch, 4.15 * inch]
+                )
+                page_table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#334155")),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#e5e7eb")),
+                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                            ("FONTSIZE", (0, 0), (-1, 0), 8),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                            ("TOPPADDING", (0, 0), (-1, -1), 4),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                            (
+                                "ROWBACKGROUNDS",
+                                (0, 1),
+                                (-1, -1),
+                                [colors.white, colors.HexColor("#f9fafb")],
+                            ),
+                        ]
+                    )
+                )
+                story.append(page_table)
+                story.append(Spacer(1, 8))
 
         doc = SimpleDocTemplate(
             temp_file.name,
@@ -431,38 +576,53 @@ class ReportService:
         summary_sheet.append(["Project", report["project"]["domain"] or ""])
         summary_sheet.append(["Crawl Date", report["crawl_date"] or ""])
         summary_sheet.append(["Overall Score", report["overall_score"] or ""])
+        summary_sheet.append(
+            ["Issue Summary", (report.get("summary") or {}).get("summary_text") or ""]
+        )
+        summary_sheet.append(
+            ["Site Issues", (report.get("summary") or {}).get("site_issue_count", 0)]
+        )
+        summary_sheet.append(
+            ["Pages With Issues", (report.get("summary") or {}).get("pages_with_issues", 0)]
+        )
+        summary_sheet.append(
+            [
+                "Page-Level Findings",
+                (report.get("summary") or {}).get("page_issue_count", 0),
+            ]
+        )
         summary_sheet.append([])
         summary_sheet.append(["Category", "Score"])
         for category, score in report["category_scores"].items():
             summary_sheet.append([self._labelize(category), score])
 
-        with SessionLocal() as db:
-            categories = db.scalars(
-                select(AuditIssue.category)
-                .where(AuditIssue.crawl_run_id == crawl_run_id)
-                .distinct()
-                .order_by(AuditIssue.category.asc())
-            ).all()
+        site_sheet = workbook.create_sheet("Site Issues")
+        site_sheet.append(["scope", "category", "rule", "severity", "message"])
+        for issue in report.get("site_issues") or []:
+            site_sheet.append(
+                [
+                    issue.get("scope") or "site",
+                    issue.get("category") or "",
+                    issue.get("rule") or "",
+                    issue.get("severity") or "",
+                    issue.get("message") or "",
+                ]
+            )
 
-            for category in categories:
-                sheet = workbook.create_sheet(self._sheet_name(category))
-                sheet.append(["url", "category", "rule", "severity", "message"])
-                rows = db.execute(
-                    select(
-                        AuditIssue.target_url,
-                        AuditIssue.category,
-                        AuditIssue.rule_id,
-                        AuditIssue.severity,
-                        AuditIssue.message,
-                    )
-                    .where(
-                        AuditIssue.crawl_run_id == crawl_run_id,
-                        AuditIssue.category == category,
-                    )
-                    .order_by(AuditIssue.id.asc())
+        page_sheet = workbook.create_sheet("Page Issues")
+        page_sheet.append(["url", "category", "rule", "severity", "message"])
+        for group in report.get("page_issues") or []:
+            url = group.get("url") or ""
+            for issue in group.get("issues") or []:
+                page_sheet.append(
+                    [
+                        url,
+                        issue.get("category") or "",
+                        issue.get("rule") or "",
+                        issue.get("severity") or "",
+                        issue.get("message") or "",
+                    ]
                 )
-                for row in rows:
-                    sheet.append([row.target_url or "", row.category, row.rule_id, row.severity, row.message])
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as temp_file:
             workbook.save(temp_file.name)
@@ -535,7 +695,7 @@ class ReportService:
               <div class="grid">
                 <div class="card">
                   <p><strong>Total Pages:</strong> {{ report.summary.total_pages }}</p>
-                  <p><strong>Total Issues:</strong> {{ report.summary.total_issues }}</p>
+                  <p><strong>Summary:</strong> {{ report.summary.summary_text }}</p>
                   <p><strong>Crawl Date:</strong> {{ report.crawl_date or "N/A" }}</p>
                 </div>
                 <div class="card">
@@ -564,31 +724,57 @@ class ReportService:
               </ul>
             </div>
 
-            {% for category in report.categories %}
-              <div class="section" style="page-break-before: always;">
-                <h2>{{ category.name }}{% if category.score is not none %} - Score {{ category.score }}{% endif %}</h2>
-                <table>
-                  <thead>
+            <div class="section" style="page-break-before: always;">
+              <h2>Site Issues</h2>
+              <p>One row per site-level finding — never duplicated per page.</p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Scope</th>
+                    <th>Rule</th>
+                    <th>Severity</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for issue in report.site_issues %}
                     <tr>
-                      <th>URL</th>
-                      <th>Rule</th>
-                      <th>Severity</th>
-                      <th>Message</th>
+                      <td>{{ issue.scope }}</td>
+                      <td>{{ issue.rule }}</td>
+                      <td>{{ issue.severity }}</td>
+                      <td>{{ issue.message }}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {% for issue in category.issues %}
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+
+            <div class="section" style="page-break-before: always;">
+              <h2>Page Issues</h2>
+              {% for group in report.page_issues %}
+                <div class="card">
+                  <h3>{{ group.url }} ({{ group.issue_count }})</h3>
+                  <table>
+                    <thead>
                       <tr>
-                        <td>{{ issue.url or "" }}</td>
-                        <td>{{ issue.rule }}</td>
-                        <td>{{ issue.severity }}</td>
-                        <td>{{ issue.message }}</td>
+                        <th>Rule</th>
+                        <th>Severity</th>
+                        <th>Message</th>
                       </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </div>
-            {% endfor %}
+                    </thead>
+                    <tbody>
+                      {% for issue in group.issues %}
+                        <tr>
+                          <td>{{ issue.rule }}</td>
+                          <td>{{ issue.severity }}</td>
+                          <td>{{ issue.message }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              {% endfor %}
+            </div>
           </body>
         </html>
         """

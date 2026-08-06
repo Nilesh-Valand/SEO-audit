@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
@@ -25,11 +26,22 @@ class ProjectResponse(BaseModel):
     created_at: datetime
 
 
+class ProjectListItemResponse(BaseModel):
+    id: int
+    domain: str
+    created_at: datetime
+    latest_run_id: int | None = None
+    latest_run_status: str | None = None
+    latest_run_finished_at: datetime | None = None
+    latest_run_started_at: datetime | None = None
+    overall_score: float | None = None
+
+
 class ProjectListResponse(BaseModel):
     total: int
     page: int
     page_size: int
-    items: list[ProjectResponse]
+    items: list[ProjectListItemResponse]
 
 
 class ScoreHistoryItemResponse(BaseModel):
@@ -43,11 +55,7 @@ class ScoreHistoryResponse(BaseModel):
     items: list[ScoreHistoryItemResponse]
 
 
-@router.get("", response_model=ProjectListResponse)
-async def list_projects(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=200),
-) -> ProjectListResponse:
+def _list_projects_sync(page: int, page_size: int) -> ProjectListResponse:
     with SessionLocal() as db:
         total = db.scalar(select(func.count()).select_from(Project)) or 0
         projects = db.scalars(
@@ -57,15 +65,49 @@ async def list_projects(
             .limit(page_size)
         ).all()
 
+        items: list[ProjectListItemResponse] = []
+        for project in projects:
+            latest_run = db.scalars(
+                select(CrawlRun)
+                .where(CrawlRun.project_id == project.id)
+                .order_by(CrawlRun.id.desc())
+                .limit(1)
+            ).first()
+            overall_score: float | None = None
+            if latest_run is not None and latest_run.status == "completed":
+                overall_score = db.scalar(
+                    select(CrawlRunScore.score).where(
+                        CrawlRunScore.crawl_id == latest_run.id,
+                        CrawlRunScore.category == "overall",
+                    )
+                )
+            items.append(
+                ProjectListItemResponse(
+                    id=project.id,
+                    domain=project.domain,
+                    created_at=project.created_at,
+                    latest_run_id=latest_run.id if latest_run else None,
+                    latest_run_status=latest_run.status if latest_run else None,
+                    latest_run_finished_at=latest_run.finished_at if latest_run else None,
+                    latest_run_started_at=latest_run.started_at if latest_run else None,
+                    overall_score=overall_score,
+                )
+            )
+
         return ProjectListResponse(
             total=total,
             page=page,
             page_size=page_size,
-            items=[
-                ProjectResponse(id=project.id, domain=project.domain, created_at=project.created_at)
-                for project in projects
-            ],
+            items=items,
         )
+
+
+@router.get("", response_model=ProjectListResponse)
+async def list_projects(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=200),
+) -> ProjectListResponse:
+    return await asyncio.to_thread(_list_projects_sync, page, page_size)
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)

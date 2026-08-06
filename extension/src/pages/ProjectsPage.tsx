@@ -37,28 +37,24 @@ function ProjectsListView() {
     setError(null);
     setUnreachable(false);
     try {
+      // Single request — backend embeds latest run status + overall score.
       const projects = await apiClient.listProjects({ page: 1, page_size: 100 });
-      const enriched = await Promise.all(
-        projects.items.map(async (project) => {
-          const runs = await apiClient.listCrawlRuns({
-            project_id: project.id,
-            page: 1,
-            page_size: 1,
-          });
-          const latestRun = runs.items[0] ?? null;
-          let overallScore: number | null = null;
-          if (latestRun && latestRun.status === "completed") {
-            try {
-              const summary = await apiClient.getSummary(latestRun.id);
-              overallScore = summary.overall_score;
-            } catch {
-              overallScore = null;
-            }
-          }
-          return { project, latestRun, overallScore };
-        }),
+      setRows(
+        projects.items.map((project) => ({
+          project,
+          latestRun: project.latest_run_id
+            ? {
+                id: project.latest_run_id,
+                project_id: project.id,
+                status: project.latest_run_status ?? "unknown",
+                total_pages: 0,
+                started_at: project.latest_run_started_at ?? null,
+                finished_at: project.latest_run_finished_at ?? null,
+              }
+            : null,
+          overallScore: project.overall_score ?? null,
+        })),
       );
-      setRows(enriched);
     } catch (err) {
       setUnreachable(shouldLinkToSettings(err));
       setError(await formatBackendError(err));
@@ -219,20 +215,27 @@ function ProjectDetailView({ projectId }: { projectId: number }) {
       const found = projects.items.find((p) => p.id === projectId) ?? null;
       setProject(found);
 
-      const withScores = await Promise.all(
-        crawlRuns.items.map(async (run) => {
-          let overallScore: number | null = null;
-          if (run.status === "completed") {
-            try {
-              const summary = await apiClient.getSummary(run.id);
-              overallScore = summary.overall_score;
-            } catch {
-              overallScore = null;
+      // Cap concurrent summary fetches so a slow/busy backend can't stall the page.
+      const withScores: (CrawlRun & { overallScore: number | null })[] = [];
+      const batchSize = 4;
+      for (let i = 0; i < crawlRuns.items.length; i += batchSize) {
+        const batch = crawlRuns.items.slice(i, i + batchSize);
+        const scored = await Promise.all(
+          batch.map(async (run) => {
+            let overallScore: number | null = null;
+            if (run.status === "completed") {
+              try {
+                const summary = await apiClient.getSummary(run.id);
+                overallScore = summary.overall_score;
+              } catch {
+                overallScore = null;
+              }
             }
-          }
-          return { ...run, overallScore };
-        }),
-      );
+            return { ...run, overallScore };
+          }),
+        );
+        withScores.push(...scored);
+      }
       setRuns(withScores);
     } catch (err) {
       setUnreachable(shouldLinkToSettings(err));

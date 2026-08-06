@@ -6,14 +6,15 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from app.models import (
-    AuditIssue,
     CrawledPage,
     CrawlRun,
     CrawlRunScore,
+    PageIssue,
     PageLink,
     PageTechnicalDetails,
     PageVital,
     Project,
+    SiteIssue,
     SitemapFinding,
 )
 from app.paths import SNAPSHOT_ROOT
@@ -21,19 +22,21 @@ from app.paths import SNAPSHOT_ROOT
 
 def _purge_crawl_run_rows(db: Session, crawl_run_id: int) -> None:
     page_ids = list(
-        db.scalars(select(CrawledPage.id).where(CrawledPage.crawl_run_id == crawl_run_id)).all()
+        db.scalars(select(CrawledPage.id).where(CrawledPage.crawl_id == crawl_run_id)).all()
     )
 
     if page_ids:
-        db.execute(delete(PageLink).where(PageLink.crawled_page_id.in_(page_ids)))
-        db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(page_ids)))
-        db.execute(delete(PageTechnicalDetails).where(PageTechnicalDetails.crawled_page_id.in_(page_ids)))
-        db.execute(delete(AuditIssue).where(AuditIssue.crawled_page_id.in_(page_ids)))
+        db.execute(delete(PageLink).where(PageLink.crawl_page_id.in_(page_ids)))
+        db.execute(delete(PageVital).where(PageVital.crawl_page_id.in_(page_ids)))
+        db.execute(
+            delete(PageTechnicalDetails).where(PageTechnicalDetails.crawl_page_id.in_(page_ids))
+        )
 
-    db.execute(delete(AuditIssue).where(AuditIssue.crawl_run_id == crawl_run_id))
-    db.execute(delete(SitemapFinding).where(SitemapFinding.crawl_run_id == crawl_run_id))
-    db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_run_id == crawl_run_id))
-    db.execute(delete(CrawledPage).where(CrawledPage.crawl_run_id == crawl_run_id))
+    db.execute(delete(SiteIssue).where(SiteIssue.crawl_id == crawl_run_id))
+    db.execute(delete(PageIssue).where(PageIssue.crawl_id == crawl_run_id))
+    db.execute(delete(SitemapFinding).where(SitemapFinding.crawl_id == crawl_run_id))
+    db.execute(delete(CrawlRunScore).where(CrawlRunScore.crawl_id == crawl_run_id))
+    db.execute(delete(CrawledPage).where(CrawledPage.crawl_id == crawl_run_id))
     db.execute(delete(CrawlRun).where(CrawlRun.id == crawl_run_id))
 
 

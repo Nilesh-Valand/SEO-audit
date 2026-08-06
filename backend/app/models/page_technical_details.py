@@ -7,13 +7,13 @@ from app.db.database import Base
 
 
 class PageTechnicalDetails(Base):
-    """Additive per-page technical signals captured during crawl (1:1 with crawled_pages)."""
+    """Additive per-page technical signals captured during crawl (1:1 with crawl_pages)."""
 
     __tablename__ = "page_technical_details"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    crawled_page_id: Mapped[int] = mapped_column(
-        ForeignKey("crawled_pages.id", ondelete="CASCADE"),
+    crawl_page_id: Mapped[int] = mapped_column(
+        ForeignKey("crawl_pages.id", ondelete="CASCADE"),
         nullable=False,
         unique=True,
         index=True,
@@ -41,6 +41,6 @@ class PageTechnicalDetails(Base):
     stylesheets_in_head: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     redirect_chain_json: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
 
-    crawled_page: Mapped["CrawledPage"] = relationship(  # noqa: F821
+    crawl_page: Mapped["CrawlPage"] = relationship(  # noqa: F821
         back_populates="technical_details"
     )

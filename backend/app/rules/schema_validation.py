@@ -64,6 +64,24 @@ def _iter_graph_nodes(payload: Any) -> list[dict[str, Any]]:
     return nodes
 
 
+def schema_blocks_have_type(blocks: list[Any], type_name: str) -> bool:
+    """True if any JSON-LD block declares the given @type (e.g. Organization, WebSite)."""
+    wanted = type_name.strip().split("/")[-1].lower()
+    if not wanted:
+        return False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        parsed = block.get("parsed")
+        if parsed is None:
+            continue
+        for node in _iter_graph_nodes(parsed):
+            for node_type in _types_of(node):
+                if node_type.lower() == wanted:
+                    return True
+    return False
+
+
 def validate_schema_blocks(blocks: list[dict[str, Any]]) -> list[str]:
     """
     Return human-readable problems for stored schema blocks.

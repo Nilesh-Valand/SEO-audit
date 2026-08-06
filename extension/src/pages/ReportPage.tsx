@@ -249,10 +249,24 @@ export function ReportPage() {
                   <p className="mt-2 text-sm leading-relaxed text-slate-500">
                     Crawl date {formatDate(report.crawl_date)} · Run #{crawlRunId}
                   </p>
-                  <div className="mt-6 grid max-w-xl grid-cols-3 gap-3">
+                  <p className="mt-3 text-sm font-medium text-slate-700">
+                    {report.summary.summary_text}
+                  </p>
+                  <div className="mt-6 grid max-w-2xl grid-cols-2 gap-3 sm:grid-cols-4">
                     <MiniStat label="Pages" value={String(report.summary.total_pages)} />
-                    <MiniStat label="Issues" value={String(report.summary.total_issues)} />
-                    <MiniStat label="Urgent" value={String(urgentCount)} accent />
+                    <MiniStat
+                      label="Site issues"
+                      value={String(report.summary.site_issue_count)}
+                    />
+                    <MiniStat
+                      label="Pages w/ issues"
+                      value={String(report.summary.pages_with_issues)}
+                    />
+                    <MiniStat
+                      label="Page findings"
+                      value={String(report.summary.page_issue_count)}
+                      accent={urgentCount > 0}
+                    />
                   </div>
                 </div>
 
@@ -572,56 +586,99 @@ export function ReportPage() {
             )}
           </section>
 
-          {/* Findings */}
+          {/* Findings — site vs page, never mixed / never duplicated */}
           <section>
             <div className="mb-4">
               <h2 className="text-lg font-semibold tracking-tight text-slate-900">
-                Findings by category
+                Site Issues
               </h2>
               <p className="mt-1 text-sm text-slate-500">
-                Full issue inventory grouped for review and export.
+                One row per site-level finding (robots, sitemap, cross-page, homepage). Never
+                repeated under individual pages.
               </p>
             </div>
-            <div className="space-y-5">
-              {report.categories.map((cat) => (
-                <Card key={cat.name} className="break-inside-avoid overflow-hidden">
-                  <CardHeader className="flex flex-row items-center justify-between gap-3 bg-slate-50/80">
-                    <CardTitle className="capitalize">{labelCategory(cat.name)}</CardTitle>
-                    <span
-                      className="rounded-xl px-3 py-1.5 text-sm font-bold tabular-nums text-white"
-                      style={{ backgroundColor: scoreColor(cat.score) }}
-                    >
-                      {formatScore(cat.score)}
-                    </span>
-                  </CardHeader>
-                  <CardContent className="p-0">
-                    {cat.issues.length === 0 ? (
-                      <p className="px-6 py-6 text-sm text-slate-500">No issues in this category.</p>
-                    ) : (
+            <Card className="break-inside-avoid overflow-hidden">
+              <CardContent className="p-0">
+                {(report.site_issues ?? []).length === 0 ? (
+                  <p className="px-6 py-8 text-sm text-slate-500">No site issues for this run.</p>
+                ) : (
+                  <ul className="divide-y divide-slate-100">
+                    {report.site_issues.map((issue) => (
+                      <li key={issue.id} className="px-5 py-4 sm:px-6">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <SeverityBadge severity={issue.severity} />
+                          <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold capitalize text-slate-600">
+                            {labelCategory(issue.category)}
+                          </span>
+                          <span className="rounded-full bg-indigo-50 px-2.5 py-0.5 text-[11px] font-semibold capitalize text-indigo-700 ring-1 ring-inset ring-indigo-100">
+                            {issue.scope.replace(/_/g, " ")}
+                          </span>
+                          <span className="rounded-md bg-slate-50 px-2 py-0.5 font-mono text-[11px] text-slate-400 ring-1 ring-inset ring-slate-200">
+                            {issue.rule}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm font-semibold text-slate-900">{issue.message}</p>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
+          </section>
+
+          <section>
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold tracking-tight text-slate-900">
+                Page Issues
+              </h2>
+              <p className="mt-1 text-sm text-slate-500">
+                Grouped by URL — only that page&apos;s rows from page_issues.
+              </p>
+            </div>
+            {(report.page_issues ?? []).length === 0 ? (
+              <Card>
+                <CardContent className="py-10 text-center text-sm text-slate-500">
+                  No page-level findings for this run.
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="space-y-4">
+                {report.page_issues.map((group) => (
+                  <Card key={group.url} className="break-inside-avoid overflow-hidden">
+                    <CardHeader className="flex flex-row items-start justify-between gap-3 bg-slate-50/80">
+                      <div className="min-w-0">
+                        <CardTitle className="truncate text-base" title={group.url}>
+                          {group.url}
+                        </CardTitle>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {group.issue_count} finding{group.issue_count === 1 ? "" : "s"}
+                        </p>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="p-0">
                       <ul className="divide-y divide-slate-100">
-                        {cat.issues.map((issue, idx) => (
-                          <li key={`${cat.name}-${idx}`} className="px-5 py-4 sm:px-6">
+                        {group.issues.map((issue) => (
+                          <li key={issue.id} className="px-5 py-4 sm:px-6">
                             <div className="flex flex-wrap items-center gap-2">
                               <SeverityBadge severity={issue.severity} />
+                              <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold capitalize text-slate-600">
+                                {labelCategory(issue.category)}
+                              </span>
                               <span className="rounded-md bg-slate-50 px-2 py-0.5 font-mono text-[11px] text-slate-400 ring-1 ring-inset ring-slate-200">
                                 {issue.rule}
                               </span>
                             </div>
-                            <p className="mt-2 text-sm font-semibold text-slate-900">{issue.message}</p>
-                            <p
-                              className="mt-1 truncate text-xs text-slate-500"
-                              title={issue.url ?? undefined}
-                            >
-                              {issue.url ?? "Site-level finding"}
+                            <p className="mt-2 text-sm font-semibold text-slate-900">
+                              {issue.message}
                             </p>
                           </li>
                         ))}
                       </ul>
-                    )}
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            )}
           </section>
         </div>
       ) : null}

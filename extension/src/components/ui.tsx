@@ -14,8 +14,20 @@ export function CardHeader({ children, className = "" }: { children: ReactNode; 
   return <div className={`border-b border-slate-100 px-6 py-4 ${className}`}>{children}</div>;
 }
 
-export function CardTitle({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return <h2 className={`text-base font-semibold tracking-tight text-slate-900 ${className}`}>{children}</h2>;
+export function CardTitle({
+  children,
+  className = "",
+  title,
+}: {
+  children: ReactNode;
+  className?: string;
+  title?: string;
+}) {
+  return (
+    <h2 className={`text-base font-semibold tracking-tight text-slate-900 ${className}`} title={title}>
+      {children}
+    </h2>
+  );
 }
 
 export function CardContent({ children, className = "" }: { children: ReactNode; className?: string }) {

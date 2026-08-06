@@ -12,7 +12,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.models import CrawledPage, CrawlRun, PageLink, PageTechnicalDetails, Project
+from app.models import CrawlPage, CrawlRun, PageLink, PageTechnicalDetails, Project
 from app.crawler.extractor import ExtractedPage
 from app.crawler.normalize import normalize_url
 from app.paths import SNAPSHOT_ROOT
@@ -66,6 +66,7 @@ class CrawlStorage:
 
             crawl_run = CrawlRun(
                 project_id=project_id,
+                domain=project.domain,
                 status="pending",
                 started_at=None,
                 finished_at=None,
@@ -175,22 +176,24 @@ class CrawlStorage:
             run_counts: dict[int, int] = {}
             for item in batch:
                 page = item.page
+                crawl_id = item.crawl_run_id
                 canonical_url = normalize_url(page.url)
                 raw_url = page.raw_url or page.url
-                html_path = self._save_html_snapshot(item.crawl_run_id, canonical_url, page.html)
+                html_path = self._save_html_snapshot(crawl_id, canonical_url, page.html)
 
                 insert_stmt = (
-                    sqlite_insert(CrawledPage)
+                    sqlite_insert(CrawlPage)
                     .values(
-                        crawl_run_id=item.crawl_run_id,
+                        crawl_id=crawl_id,
                         url=canonical_url,
                         raw_url=raw_url if raw_url != canonical_url else None,
                         status_code=page.status_code,
                         title=page.title,
                         meta_description=page.meta_description,
-                        canonical_url=page.canonical_url,
+                        canonical=page.canonical_url,
                         meta_robots=page.meta_robots,
                         h1=page.primary_h1,
+                        h1_list=page.headings.get("h1") or [],
                         word_count=page.word_count,
                         response_time_ms=page.response_time_ms,
                         redirect_hops=page.redirect_hops,
@@ -200,16 +203,16 @@ class CrawlStorage:
                         rendered_diff_significant=page.rendered_diff_significant,
                         raw_html_path=html_path,
                     )
-                    .on_conflict_do_nothing(index_elements=["crawl_run_id", "url"])
+                    .on_conflict_do_nothing(index_elements=["crawl_id", "url"])
                 )
                 result = db.execute(insert_stmt)
                 if not result.rowcount:
                     continue
 
                 page_row = db.scalar(
-                    select(CrawledPage).where(
-                        CrawledPage.crawl_run_id == item.crawl_run_id,
-                        CrawledPage.url == canonical_url,
+                    select(CrawlPage).where(
+                        CrawlPage.crawl_id == crawl_id,
+                        CrawlPage.url == canonical_url,
                     )
                 )
                 if page_row is None:
@@ -218,7 +221,7 @@ class CrawlStorage:
                 for link in page.links:
                     db.add(
                         PageLink(
-                            crawled_page_id=page_row.id,
+                            crawl_page_id=page_row.id,
                             target_url=link.target_url,
                             is_internal=link.is_internal,
                             anchor_text=link.anchor_text,
@@ -227,7 +230,7 @@ class CrawlStorage:
 
                 db.add(
                     PageTechnicalDetails(
-                        crawled_page_id=page_row.id,
+                        crawl_page_id=page_row.id,
                         url_has_uppercase=page.url_has_uppercase,
                         url_has_underscore=page.url_has_underscore,
                         url_length=page.url_length,
@@ -271,7 +274,7 @@ class CrawlStorage:
                     )
                 )
 
-                run_counts[item.crawl_run_id] = run_counts.get(item.crawl_run_id, 0) + 1
+                run_counts[crawl_id] = run_counts.get(crawl_id, 0) + 1
                 written += 1
 
             if run_counts:

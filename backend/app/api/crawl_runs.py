@@ -12,10 +12,11 @@ from starlette.responses import StreamingResponse
 
 from app.crawler.storage import CrawlStorage
 from app.db.database import SessionLocal
-from app.models import AuditIssue, CrawledPage, CrawlRun, CrawlRunScore
+from app.models import CrawledPage, CrawlRun, CrawlRunScore, PageIssue
 from app.rules.engine import RuleEngine
 from app.services.crawl_runs import cancel_crawl_run, get_progress, is_active, start_crawl_run
 from app.services.deletions import delete_crawl_run
+from app.services.issues import IssueView, count_issues_by_severity, load_issue_views
 from app.services.report import ReportService, iter_file_chunks, remove_file
 
 router = APIRouter(prefix="/crawl-runs", tags=["crawl-runs"])
@@ -95,7 +96,7 @@ class PageDetailsResponse(BaseModel):
 
 
 class AuditIssueResponse(BaseModel):
-    id: int
+    id: str
     rule_id: str
     category: str
     severity: str
@@ -145,16 +146,53 @@ class CrawledPageListResponse(BaseModel):
 
 
 class ReportIssueResponse(BaseModel):
-    url: str | None
+    url: str | None = None
     rule: str
     severity: str
     message: str
+    scope: str | None = None
+    category: str | None = None
+    id: str | None = None
 
 
 class ReportCategoryResponse(BaseModel):
     name: str
     score: float | None
     issues: list[ReportIssueResponse]
+
+
+class ReportSiteIssueResponse(BaseModel):
+    id: str
+    rule: str
+    severity: str
+    category: str
+    message: str
+    scope: str
+
+
+class ReportPageIssueItemResponse(BaseModel):
+    id: str
+    rule: str
+    severity: str
+    category: str
+    message: str
+    scope: str = "page"
+
+
+class ReportPageIssueGroupResponse(BaseModel):
+    url: str
+    issue_count: int
+    issues: list[ReportPageIssueItemResponse]
+
+
+class ReportSummaryResponse(BaseModel):
+    total_pages: int
+    total_issues: int
+    site_issue_count: int
+    pages_with_issues: int
+    page_issue_count: int
+    summary_text: str
+    issues_by_severity: dict[str, int]
 
 
 class RecommendationResponse(BaseModel):
@@ -170,7 +208,9 @@ class ReportResponse(BaseModel):
     crawl_date: str | None
     overall_score: float | None
     category_scores: dict[str, float]
-    summary: dict[str, object]
+    summary: ReportSummaryResponse
+    site_issues: list[ReportSiteIssueResponse]
+    page_issues: list[ReportPageIssueGroupResponse]
     categories: list[ReportCategoryResponse]
     recommendations: list[RecommendationResponse]
 
@@ -200,6 +240,33 @@ def _require_crawl_run(crawl_run_id: int) -> CrawlRun:
             detail=f"Crawl run {crawl_run_id} not found.",
         )
     return crawl_run
+
+
+def _site_start_url_for_crawl(crawl_run_id: int, domain: str | None) -> str:
+    """Resolve an absolute root URL for SITE asset fetches on re-audit."""
+    with SessionLocal() as db:
+        first_page = db.scalars(
+            select(CrawledPage)
+            .where(CrawledPage.crawl_id == crawl_run_id)
+            .order_by(CrawledPage.id.asc())
+            .limit(1)
+        ).first()
+        if first_page and first_page.url:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(first_page.url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}/"
+
+    raw = (domain or "").strip()
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw if raw.endswith("/") else f"{raw}/"
+    if raw:
+        return f"https://{raw.rstrip('/')}/"
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Cannot resolve site root URL for site checks.",
+    )
 
 
 def _build_page_vitals(page: CrawledPage) -> PageVitalsResponse | None:
@@ -292,7 +359,7 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
                 db.scalar(
                     select(func.count())
                     .select_from(CrawledPage)
-                    .where(CrawledPage.crawl_run_id == crawl_run_id)
+                    .where(CrawledPage.crawl_id == crawl_run_id)
                 )
                 or 0
             )
@@ -300,7 +367,7 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
                 db.scalar(
                     select(func.count())
                     .select_from(CrawlRunScore)
-                    .where(CrawlRunScore.crawl_run_id == crawl_run_id)
+                    .where(CrawlRunScore.crawl_id == crawl_run_id)
                 )
                 or 0
             )
@@ -360,35 +427,31 @@ async def remove_crawl_run(crawl_run_id: int) -> Response:
 
 @router.get("/{crawl_run_id}/summary", response_model=CrawlRunSummaryResponse)
 async def get_crawl_run_summary(crawl_run_id: int) -> CrawlRunSummaryResponse:
-    _require_crawl_run(crawl_run_id)
-    with SessionLocal() as db:
-        total_pages = db.scalar(
-            select(func.count()).select_from(CrawledPage).where(CrawledPage.crawl_run_id == crawl_run_id)
-        ) or 0
+    def _build() -> CrawlRunSummaryResponse:
+        _require_crawl_run(crawl_run_id)
+        with SessionLocal() as db:
+            total_pages = db.scalar(
+                select(func.count()).select_from(CrawledPage).where(CrawledPage.crawl_id == crawl_run_id)
+            ) or 0
 
-        scores = db.scalars(
-            select(CrawlRunScore)
-            .where(CrawlRunScore.crawl_run_id == crawl_run_id)
-            .order_by(CrawlRunScore.category.asc())
-        ).all()
-        category_scores = {score.category: score.score for score in scores if score.category != "overall"}
-        overall_score = next((score.score for score in scores if score.category == "overall"), None)
+            scores = db.scalars(
+                select(CrawlRunScore)
+                .where(CrawlRunScore.crawl_id == crawl_run_id)
+                .order_by(CrawlRunScore.category.asc())
+            ).all()
+            category_scores = {score.category: score.score for score in scores if score.category != "overall"}
+            overall_score = next((score.score for score in scores if score.category == "overall"), None)
 
-        severity_rows = db.execute(
-            select(AuditIssue.severity, func.count(AuditIssue.id))
-            .where(AuditIssue.crawl_run_id == crawl_run_id)
-            .group_by(AuditIssue.severity)
-        ).all()
-        severity_counts = {severity: count for severity, count in severity_rows}
-        for severity in ("critical", "high", "medium", "low"):
-            severity_counts.setdefault(severity, 0)
+            severity_counts = count_issues_by_severity(db, crawl_run_id)
 
-        return CrawlRunSummaryResponse(
-            overall_score=overall_score,
-            category_scores=category_scores,
-            total_pages=total_pages,
-            total_issues_by_severity=severity_counts,
-        )
+            return CrawlRunSummaryResponse(
+                overall_score=overall_score,
+                category_scores=category_scores,
+                total_pages=total_pages,
+                total_issues_by_severity=severity_counts,
+            )
+
+    return await asyncio.to_thread(_build)
 
 
 @router.post("/{crawl_run_id}/run-audit", response_model=RunAuditResponse)
@@ -404,7 +467,7 @@ async def run_audit(crawl_run_id: int) -> RunAuditResponse:
             db.scalar(
                 select(func.count())
                 .select_from(CrawledPage)
-                .where(CrawledPage.crawl_run_id == crawl_run_id)
+                .where(CrawledPage.crawl_id == crawl_run_id)
             )
             or 0
         )
@@ -414,16 +477,26 @@ async def run_audit(crawl_run_id: int) -> RunAuditResponse:
             detail="No crawled pages available to audit.",
         )
 
+    start_url = _site_start_url_for_crawl(crawl_run_id, crawl_run.domain)
     try:
-        result = await asyncio.to_thread(rule_engine.run, crawl_run_id)
+        from app.checks.orchestrator import run_audit as run_orchestrated_audit
+
+        # Pages already exist — re-run check phases + finish (scores / finished_at).
+        ctx = await run_orchestrated_audit(
+            crawl_run_id,
+            start_url=start_url,
+            steps=("site", "page", "cross_page", "homepage", "finish"),
+        )
+        score_result = ctx.results.get("scores") or {}
+        result = {
+            "issues_created": int(score_result.get("issues_created", 0)),
+            "scores_created": int(score_result.get("scores_created", 0)),
+        }
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-
-    if crawl_run.status != "completed":
-        storage.set_run_completed(crawl_run_id)
 
     return RunAuditResponse(
         crawl_run_id=crawl_run_id,
@@ -443,52 +516,69 @@ async def get_crawl_run_issues(
     _require_crawl_run(crawl_run_id)
 
     with SessionLocal() as db:
-        filters = [AuditIssue.crawl_run_id == crawl_run_id]
-        if category:
-            filters.append(AuditIssue.category == category)
-        if severity:
-            filters.append(AuditIssue.severity == severity)
+        rules_by_id = {rule.id: rule for rule in rule_engine.rules}
+        views = load_issue_views(
+            db,
+            crawl_run_id,
+            category=category,
+            severity=severity,
+            rules_by_id=rules_by_id,
+        )
+        views.sort(key=lambda item: item.id)
+        total = len(views)
+        page_views = views[(page - 1) * page_size : page * page_size]
 
-        total = db.scalar(select(func.count()).select_from(AuditIssue).where(*filters)) or 0
-        issues = db.scalars(
-            select(AuditIssue)
-            .where(*filters)
-            .options(joinedload(AuditIssue.crawled_page).joinedload(CrawledPage.page_vitals))
-            .order_by(AuditIssue.id.asc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-        ).unique().all()
+        page_urls = {view.url for view in page_views if view.scope == "page" and view.url}
+        pages_by_url: dict[str, CrawledPage] = {}
+        if page_urls:
+            page_rows = (
+                db.scalars(
+                    select(CrawledPage)
+                    .where(
+                        CrawledPage.crawl_id == crawl_run_id,
+                        CrawledPage.url.in_(page_urls),
+                    )
+                    .options(joinedload(CrawledPage.page_vitals))
+                )
+                .unique()
+                .all()
+            )
+            pages_by_url = {row.url: row for row in page_rows}
+
+        items: list[AuditIssueResponse] = []
+        for view in page_views:
+            crawled_page = pages_by_url.get(view.url) if view.scope == "page" and view.url else None
+            items.append(
+                AuditIssueResponse(
+                    id=view.id,
+                    rule_id=view.check_name,
+                    category=view.category,
+                    severity=view.severity,
+                    target_url=view.url,
+                    message=view.details,
+                    page_details=(
+                        PageDetailsResponse(
+                            id=crawled_page.id,
+                            url=crawled_page.url,
+                            title=crawled_page.title,
+                            meta_description=crawled_page.meta_description,
+                            canonical_url=crawled_page.canonical_url,
+                            word_count=crawled_page.word_count,
+                            status_code=crawled_page.status_code,
+                            response_time_ms=crawled_page.response_time_ms,
+                            vitals=_build_page_vitals(crawled_page),
+                        )
+                        if crawled_page
+                        else None
+                    ),
+                )
+            )
 
         return AuditIssueListResponse(
             total=total,
             page=page,
             page_size=page_size,
-            items=[
-                AuditIssueResponse(
-                    id=issue.id,
-                    rule_id=issue.rule_id,
-                    category=issue.category,
-                    severity=issue.severity,
-                    target_url=issue.target_url or (issue.crawled_page.url if issue.crawled_page else None),
-                    message=issue.message,
-                    page_details=(
-                        PageDetailsResponse(
-                            id=issue.crawled_page.id,
-                            url=issue.crawled_page.url,
-                            title=issue.crawled_page.title,
-                            meta_description=issue.crawled_page.meta_description,
-                            canonical_url=issue.crawled_page.canonical_url,
-                            word_count=issue.crawled_page.word_count,
-                            status_code=issue.crawled_page.status_code,
-                            response_time_ms=issue.crawled_page.response_time_ms,
-                            vitals=_build_page_vitals(issue.crawled_page),
-                        )
-                        if issue.crawled_page
-                        else None
-                    ),
-                )
-                for issue in issues
-            ],
+            items=items,
         )
 
 
@@ -506,23 +596,30 @@ async def get_crawl_run_pages(
     _require_crawl_run(crawl_run_id)
 
     with SessionLocal() as db:
-        filters = [CrawledPage.crawl_run_id == crawl_run_id]
+        filters = [CrawledPage.crawl_id == crawl_run_id]
         if status_code is not None:
             filters.append(CrawledPage.status_code == status_code)
         if search:
             filters.append(CrawledPage.url.ilike(f"%{search}%"))
 
-        query = select(CrawledPage).where(*filters).options(joinedload(CrawledPage.audit_issues))
-        count_query = select(func.count(func.distinct(CrawledPage.id))).where(*filters)
         if issue_category:
-            query = query.join(AuditIssue).where(
-                AuditIssue.crawl_run_id == crawl_run_id,
-                AuditIssue.category == issue_category,
-            )
-            count_query = count_query.join(AuditIssue).where(
-                AuditIssue.crawl_run_id == crawl_run_id,
-                AuditIssue.category == issue_category,
-            )
+            rules_by_id = {rule.id: rule for rule in rule_engine.rules}
+            category_urls = {
+                view.url
+                for view in load_issue_views(
+                    db,
+                    crawl_run_id,
+                    category=issue_category,
+                    rules_by_id=rules_by_id,
+                )
+                if view.url
+            }
+            if not category_urls:
+                return CrawledPageListResponse(total=0, page=page, page_size=page_size, items=[])
+            filters.append(CrawledPage.url.in_(category_urls))
+
+        query = select(CrawledPage).where(*filters)
+        count_query = select(func.count()).select_from(CrawledPage).where(*filters)
 
         sort_map = {
             "url": CrawledPage.url,
@@ -536,7 +633,15 @@ async def get_crawl_run_pages(
         total = db.scalar(count_query) or 0
         pages = db.scalars(
             query.offset((page - 1) * page_size).limit(page_size)
-        ).unique().all()
+        ).all()
+
+        issue_counts = dict(
+            db.execute(
+                select(PageIssue.url, func.count())
+                .where(PageIssue.crawl_id == crawl_run_id)
+                .group_by(PageIssue.url)
+            ).all()
+        )
 
         return CrawledPageListResponse(
             total=total,
@@ -550,7 +655,7 @@ async def get_crawl_run_pages(
                     status_code=crawled_page.status_code,
                     word_count=crawled_page.word_count,
                     response_time_ms=crawled_page.response_time_ms,
-                    issue_count=len(crawled_page.audit_issues),
+                    issue_count=int(issue_counts.get(crawled_page.url, 0)),
                 )
                 for crawled_page in pages
             ],
@@ -563,7 +668,7 @@ async def get_crawl_run_scores(crawl_run_id: int) -> ScoreListResponse:
     with SessionLocal() as db:
         scores = db.scalars(
             select(CrawlRunScore)
-            .where(CrawlRunScore.crawl_run_id == crawl_run_id)
+            .where(CrawlRunScore.crawl_id == crawl_run_id)
             .order_by(CrawlRunScore.category.asc())
         ).all()
 
@@ -572,19 +677,17 @@ async def get_crawl_run_scores(crawl_run_id: int) -> ScoreListResponse:
         )
 
 
-def _issue_match_key(issue: AuditIssue) -> tuple[str, str]:
-    url = issue.target_url or (issue.crawled_page.url if issue.crawled_page else None) or ""
-    return (url, issue.rule_id)
+def _issue_match_key(issue: IssueView) -> tuple[str, str]:
+    return (issue.url or "", issue.check_name)
 
 
-def _to_diff_issue(issue: AuditIssue) -> DiffIssueResponse:
-    url = issue.target_url or (issue.crawled_page.url if issue.crawled_page else None)
+def _to_diff_issue(issue: IssueView) -> DiffIssueResponse:
     return DiffIssueResponse(
-        rule_id=issue.rule_id,
+        rule_id=issue.check_name,
         category=issue.category,
         severity=issue.severity,
-        target_url=url,
-        message=issue.message,
+        target_url=issue.url,
+        message=issue.details,
     )
 
 
@@ -607,25 +710,16 @@ async def get_crawl_run_diff(
         )
 
     with SessionLocal() as db:
-        current_issues = db.scalars(
-            select(AuditIssue)
-            .where(AuditIssue.crawl_run_id == crawl_run_id)
-            .options(joinedload(AuditIssue.crawled_page))
-            .order_by(AuditIssue.id.asc())
-        ).all()
-        previous_issues = db.scalars(
-            select(AuditIssue)
-            .where(AuditIssue.crawl_run_id == compare_to)
-            .options(joinedload(AuditIssue.crawled_page))
-            .order_by(AuditIssue.id.asc())
-        ).all()
+        rules_by_id = {rule.id: rule for rule in rule_engine.rules}
+        current_issues = load_issue_views(db, crawl_run_id, rules_by_id=rules_by_id)
+        previous_issues = load_issue_views(db, compare_to, rules_by_id=rules_by_id)
 
-        current_by_key: dict[tuple[str, str], AuditIssue] = {}
+        current_by_key: dict[tuple[str, str], IssueView] = {}
         for issue in current_issues:
             key = _issue_match_key(issue)
             current_by_key.setdefault(key, issue)
 
-        previous_by_key: dict[tuple[str, str], AuditIssue] = {}
+        previous_by_key: dict[tuple[str, str], IssueView] = {}
         for issue in previous_issues:
             key = _issue_match_key(issue)
             previous_by_key.setdefault(key, issue)

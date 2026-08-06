@@ -18,7 +18,6 @@ from app.crawler.extractor import (
     extract_page_data,
     rendered_content_differs,
 )
-from app.crawler.site_checks import run_site_checks
 from app.crawler.storage import CrawlStorage
 from app.crawler.normalize import normalize_url, prefer_www_from_seed
 
@@ -96,20 +95,8 @@ class CrawlerService:
             timeout=timeout,
             headers=headers,
         ) as client:
-            try:
-                site_checks = await run_site_checks(client, start_url=self.start_url)
-                self.storage.save_site_checks(
-                    crawl_run_id,
-                    robots_txt_found=site_checks.robots_txt_found,
-                    robots_txt_valid=site_checks.robots_txt_valid,
-                    robots_txt_ai_disallowed=site_checks.robots_txt_ai_disallowed,
-                    robots_txt_raw=site_checks.robots_txt_raw,
-                    llms_txt_present=site_checks.llms_txt_present,
-                    soft_404=site_checks.soft_404,
-                )
-            except Exception as exc:
-                logger.warning("Site checks failed for crawl run %s: %s", crawl_run_id, exc)
-
+            # Page crawl only — SITE / PAGE / CROSS_PAGE / HOMEPAGE checks are owned
+            # by checks.orchestrator (phases 2–5), not the crawler loop.
             flush_stop = asyncio.Event()
             flush_task = asyncio.create_task(self._periodic_flush(flush_stop))
             start = normalize_url(self.start_url, prefer_www=self.prefer_www)

@@ -14,6 +14,11 @@ export type Project = {
   id: number;
   domain: string;
   created_at: string;
+  latest_run_id?: number | null;
+  latest_run_status?: string | null;
+  latest_run_finished_at?: string | null;
+  latest_run_started_at?: string | null;
+  overall_score?: number | null;
 };
 
 export type CrawlRun = {
@@ -98,8 +103,32 @@ export type AuditReport = {
   summary: {
     total_pages: number;
     total_issues: number;
+    site_issue_count: number;
+    pages_with_issues: number;
+    page_issue_count: number;
+    summary_text: string;
     issues_by_severity: Record<string, number>;
   };
+  site_issues: {
+    id: string;
+    rule: string;
+    severity: string;
+    category: string;
+    message: string;
+    scope: string;
+  }[];
+  page_issues: {
+    url: string;
+    issue_count: number;
+    issues: {
+      id: string;
+      rule: string;
+      severity: string;
+      category: string;
+      message: string;
+      scope: string;
+    }[];
+  }[];
   categories: {
     name: string;
     score: number | null;
@@ -108,6 +137,9 @@ export type AuditReport = {
       rule: string;
       severity: string;
       message: string;
+      scope?: string | null;
+      category?: string | null;
+      id?: string | null;
     }[];
   }[];
   recommendations: {

@@ -10,8 +10,8 @@ class SitemapFinding(Base):
     __tablename__ = "sitemap_findings"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    crawl_run_id: Mapped[int] = mapped_column(
-        ForeignKey("crawl_runs.id"), nullable=False, index=True
+    crawl_id: Mapped[int] = mapped_column(
+        ForeignKey("crawls.id"), nullable=False, index=True
     )
     url: Mapped[str] = mapped_column(Text, nullable=False)
     finding_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -20,4 +20,4 @@ class SitemapFinding(Base):
         DateTime, default=func.now(), nullable=False
     )
 
-    crawl_run: Mapped["CrawlRun"] = relationship()  # noqa: F821
+    crawl: Mapped["Crawl"] = relationship()  # noqa: F821

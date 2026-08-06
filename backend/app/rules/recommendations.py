@@ -28,6 +28,18 @@ RULE_RECOMMENDATIONS: dict[str, str] = {
         "Do not canonicalize to a noindex page. Point the canonical at an "
         "indexable URL, or remove noindex from the intended canonical target."
     ),
+    "organization_schema": (
+        "Add Organization JSON-LD on the homepage so search engines and AI "
+        "systems can identify your brand entity (name, URL, logo)."
+    ),
+    "website_schema": (
+        "Add WebSite JSON-LD on the homepage (optionally with SearchAction) "
+        "so crawlers understand the site as a whole."
+    ),
+    "missing_favicon": (
+        "Add a favicon on the homepage via <link rel=\"icon\"> or /favicon.ico "
+        "so browsers and SERPs can display your brand mark."
+    ),
 }
 
 

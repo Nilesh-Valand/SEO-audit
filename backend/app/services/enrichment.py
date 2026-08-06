@@ -195,11 +195,11 @@ class EnrichmentService:
     def _save_page_vitals(self, records: list[PageVitalRecord]) -> None:
         page_ids = list({record.crawled_page_id for record in records})
         with self._session_factory() as db:
-            db.execute(delete(PageVital).where(PageVital.crawled_page_id.in_(page_ids)))
+            db.execute(delete(PageVital).where(PageVital.crawl_page_id.in_(page_ids)))
             for record in records:
                 db.add(
                     PageVital(
-                        crawled_page_id=record.crawled_page_id,
+                        crawl_page_id=record.crawled_page_id,
                         lcp_ms=record.lcp_ms,
                         inp_ms=record.inp_ms,
                         cls=record.cls,
@@ -383,11 +383,11 @@ class EnrichmentService:
 
     def _save_sitemap_comparison(self, crawl_run_id: int, comparison: SitemapComparison) -> None:
         with self._session_factory() as db:
-            db.execute(delete(SitemapFinding).where(SitemapFinding.crawl_run_id == crawl_run_id))
+            db.execute(delete(SitemapFinding).where(SitemapFinding.crawl_id == crawl_run_id))
             for url, finding_type, message in comparison.findings:
                 db.add(
                     SitemapFinding(
-                        crawl_run_id=crawl_run_id,
+                        crawl_id=crawl_run_id,
                         url=url,
                         finding_type=finding_type,
                         message=message,
@@ -401,7 +401,7 @@ class EnrichmentService:
             if crawl_run is None:
                 return None
             pages = db.scalars(
-                select(CrawledPage).where(CrawledPage.crawl_run_id == crawl_run_id)
+                select(CrawledPage).where(CrawledPage.crawl_id == crawl_run_id)
             ).all()
             return CrawlRunContext(
                 crawl_run_id=crawl_run.id,

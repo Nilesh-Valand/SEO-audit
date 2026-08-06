@@ -246,9 +246,19 @@
   condition: missing_html_lang
 - id: missing_favicon
   category: on_page
-  description: No favicon was detected.
+  description: No favicon was detected on the homepage.
   severity: low
   condition: missing_favicon
+- id: organization_schema
+  category: on_page
+  description: Homepage is missing Organization JSON-LD schema.
+  severity: medium
+  condition: organization_schema
+- id: website_schema
+  category: on_page
+  description: Homepage is missing WebSite JSON-LD schema.
+  severity: medium
+  condition: website_schema
 - id: generic_404_page
   category: on_page
   description: Site does not return a proper custom 404 for unknown URLs.
