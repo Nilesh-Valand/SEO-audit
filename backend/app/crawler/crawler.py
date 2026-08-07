@@ -16,6 +16,7 @@ from app.crawler.extractor import (
     ExtractedPage,
     RedirectHop,
     extract_page_data,
+    is_http_url,
     rendered_content_differs,
 )
 from app.crawler.storage import CrawlStorage
@@ -199,7 +200,11 @@ class CrawlerService:
                     final_page = rendered_page
 
             if final_page.html is not None:
-                await self._enrich_page_signals(client, final_page)
+                try:
+                    await self._enrich_page_signals(client, final_page)
+                except Exception:
+                    # Weight/favicon probes must never abort storing the page.
+                    logger.exception("Page signal enrichment failed for %s", url)
 
             discovered_urls = [
                 link.target_url for link in final_page.links if link.is_internal
@@ -304,7 +309,7 @@ class CrawlerService:
         seen: set[str] = set()
         count = 1  # HTML document itself
         for url in [*page.stylesheet_urls, *page.script_urls, *(img.src for img in page.images)]:
-            if not url or url in seen:
+            if not is_http_url(url) or url in seen:
                 continue
             seen.add(url)
             count += 1
@@ -331,7 +336,7 @@ class CrawlerService:
         seen: set[str] = set()
 
         for url in [*page.stylesheet_urls, *page.script_urls, *(img.src for img in page.images)]:
-            if not url or url in seen:
+            if not is_http_url(url) or url in seen:
                 continue
             seen.add(url)
             resource_urls.append(url)
@@ -351,6 +356,8 @@ class CrawlerService:
         return total + sum(sizes)
 
     async def _resource_size_bytes(self, client: httpx.AsyncClient, url: str) -> int:
+        if not is_http_url(url):
+            return 0
         try:
             response = await client.head(url)
             if response.status_code in {405, 501}:
@@ -364,7 +371,8 @@ class CrawlerService:
             if response.request.method.upper() == "HEAD":
                 return 0
             return len(response.content)
-        except httpx.HTTPError:
+        except Exception:
+            # Unsupported schemes / network errors — treat as zero weight.
             return 0
 
     async def _ensure_browser(self) -> Browser | None:

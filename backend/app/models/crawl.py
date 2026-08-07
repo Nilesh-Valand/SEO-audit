@@ -19,6 +19,12 @@ class Crawl(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     total_urls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # Live audit phase progress (read by lightweight status polls)
+    phase: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    phase_current: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    phase_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Site-level probe results (once per crawl)
     robots_txt_found: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     robots_txt_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

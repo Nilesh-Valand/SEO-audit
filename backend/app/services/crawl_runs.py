@@ -47,7 +47,13 @@ def start_crawl_run(
                 ),
             )
         except asyncio.CancelledError:
-            storage.set_run_failed(crawl_run_id)
+            storage.set_run_failed(
+                crawl_run_id,
+                error_message=(
+                    "Crawl was cancelled (server reload/shutdown). "
+                    "Start uvicorn with --reload-dir app."
+                ),
+            )
             logger.warning(
                 "Crawl run %s was cancelled (server reload/shutdown). Start uvicorn with "
                 "`--reload-dir app` so crawl data under backend/data/ does not restart the process.",
@@ -56,7 +62,7 @@ def start_crawl_run(
             raise
         except Exception as exc:
             logger.exception("Crawl run %s failed: %s", crawl_run_id, exc)
-            storage.set_run_failed(crawl_run_id)
+            storage.set_run_failed(crawl_run_id, error_message=str(exc))
             raise
 
     task = asyncio.create_task(runner(), name=f"crawl-run-{crawl_run_id}")

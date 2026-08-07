@@ -2,13 +2,21 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { BackendUnreachable } from "../components/BackendUnreachable";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui";
-import { apiClient, type Project } from "../lib/api";
+import { apiClient, type CrawlRunProgress, type Project } from "../lib/api";
 import { useAuditSelection } from "../lib/AuditSelectionContext";
-import { formatBackendError, shouldLinkToSettings } from "../lib/errors";
+import {
+  formatBackendError,
+  isTimeoutError,
+  shouldLinkToSettings,
+} from "../lib/errors";
 import { normalizeUrl, ProgressBar, StatusPill } from "../lib/format";
 
-const POLL_MS = 2500;
-const MAX_POLL_FAILURES = 5;
+const POLL_MS = 3000;
+/** Soft poll failures (timeouts while job is still running) before we warn. */
+const MAX_SOFT_FAILURES = 8;
+/** Hard failures (backend down) before we stop — ~2+ minutes with backoff. */
+const MAX_HARD_FAILURES = 5;
+const FATAL_FAILURE_WINDOW_MS = 120_000;
 
 function domainFromUrl(url: string): string {
   try {
@@ -24,6 +32,27 @@ async function findOrCreateProject(startUrl: string): Promise<Project> {
   const match = existing.items.find((p) => p.domain.toLowerCase() === domain);
   if (match) return match;
   return apiClient.createProject(domain);
+}
+
+function progressCopy(progress: CrawlRunProgress | null, pagesCrawled: number, maxPages: number): string {
+  if (!progress) return "Starting…";
+  if (progress.status === "failed") {
+    return progress.error_message || "Crawl failed.";
+  }
+  if (progress.status === "completed") {
+    return "Complete — opening dashboard…";
+  }
+  const label = progress.phase_label;
+  const cur = progress.phase_current;
+  const tot = progress.phase_total;
+  if (label && cur != null && tot != null && tot > 0) {
+    return `${label}: ${cur} / ${tot}`;
+  }
+  if (label) return `${label}…`;
+  if (progress.status === "enriching" || pagesCrawled >= maxPages) {
+    return "Running checks & scoring…";
+  }
+  return "Crawl in progress";
 }
 
 export function NewAuditPage() {
@@ -43,10 +72,14 @@ export function NewAuditPage() {
   const [status, setStatus] = useState<string | null>(null);
   const [pagesCrawled, setPagesCrawled] = useState(0);
   const [activeMaxPages, setActiveMaxPages] = useState(50);
+  const [latestProgress, setLatestProgress] = useState<CrawlRunProgress | null>(null);
 
   const pollRef = useRef<number | null>(null);
   const cancelledRef = useRef(false);
-  const pollFailuresRef = useRef(0);
+  const inFlightRef = useRef(false);
+  const softFailuresRef = useRef(0);
+  const hardFailuresRef = useRef(0);
+  const firstFailureAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
@@ -63,60 +96,95 @@ export function NewAuditPage() {
       pollRef.current = null;
     }
     setPolling(false);
+    inFlightRef.current = false;
+  }
+
+  function resetFailureCounters() {
+    softFailuresRef.current = 0;
+    hardFailuresRef.current = 0;
+    firstFailureAtRef.current = null;
   }
 
   async function pollOnce(runId: number, projId: number) {
-    const progress = await apiClient.getCrawlRun(runId);
-    if (cancelledRef.current) return;
-
-    pollFailuresRef.current = 0;
-    setUnreachable(false);
-    setError(null);
-    setStatus(progress.status);
-    setPagesCrawled(progress.pages_crawled);
-
-    const done =
-      !progress.active &&
-      (progress.status === "completed" || progress.status === "failed");
-
-    if (!done) return;
-
-    stopPolling();
-
-    if (progress.status === "failed") {
-      setError(
-        "Crawl failed. Check the backend terminal for the error, restart uvicorn with `--reload-dir app`, then try again.",
-      );
-      setSubmitting(false);
-      return;
-    }
-
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
-      const summary = await apiClient.getSummary(runId);
-      if (summary.overall_score == null) {
-        await apiClient.runAudit(runId);
-      }
-    } catch {
-      // Dashboard can still load; scores may be generated on demand later.
-    }
+      const progress = await apiClient.getCrawlRun(runId);
+      if (cancelledRef.current) return;
 
-    await selectAudit(projId, runId);
-    navigate("/");
+      resetFailureCounters();
+      setUnreachable(false);
+      setError(null);
+      setLatestProgress(progress);
+      setStatus(progress.status);
+      setPagesCrawled(progress.pages_crawled);
+
+      const done =
+        !progress.active &&
+        (progress.status === "completed" || progress.status === "failed");
+
+      if (!done) return;
+
+      stopPolling();
+
+      if (progress.status === "failed") {
+        setError(
+          progress.error_message ||
+            "Crawl failed. Check the backend terminal for the error, then try again.",
+        );
+        setSubmitting(false);
+        return;
+      }
+
+      try {
+        const summary = await apiClient.getSummary(runId);
+        if (summary.overall_score == null) {
+          await apiClient.runAudit(runId);
+        }
+      } catch {
+        // Dashboard can still load; scores may be generated on demand later.
+      }
+
+      await selectAudit(projId, runId);
+      navigate("/");
+    } finally {
+      inFlightRef.current = false;
+    }
   }
 
   function startPolling(runId: number, projId: number) {
     setPolling(true);
-    pollFailuresRef.current = 0;
+    resetFailureCounters();
     setUnreachable(false);
     setError(null);
 
     const handlePollError = async (err: unknown) => {
       if (cancelledRef.current) return;
-      pollFailuresRef.current += 1;
-      // Transient blips (reload, brief busy period) should not abort a live crawl.
-      if (pollFailuresRef.current < MAX_POLL_FAILURES) {
+
+      const now = Date.now();
+      if (firstFailureAtRef.current == null) {
+        firstFailureAtRef.current = now;
+      }
+
+      const timedOut = isTimeoutError(err);
+      // Timeouts while a job is running are expected during PageSpeed — stay quiet.
+      if (timedOut) {
+        softFailuresRef.current += 1;
+        if (softFailuresRef.current < MAX_SOFT_FAILURES) {
+          return;
+        }
+      } else {
+        hardFailuresRef.current += 1;
+        if (hardFailuresRef.current < MAX_HARD_FAILURES) {
+          return;
+        }
+      }
+
+      const elapsed = now - (firstFailureAtRef.current ?? now);
+      if (elapsed < FATAL_FAILURE_WINDOW_MS && hardFailuresRef.current < MAX_HARD_FAILURES) {
         return;
       }
+
       stopPolling();
       setSubmitting(false);
       setUnreachable(shouldLinkToSettings(err));
@@ -162,6 +230,7 @@ export function NewAuditPage() {
     setSubmitting(true);
     setPagesCrawled(0);
     setStatus("pending");
+    setLatestProgress(null);
 
     try {
       const project = await findOrCreateProject(url);
@@ -181,8 +250,19 @@ export function NewAuditPage() {
     }
   }
 
-  const progressPct =
+  const phaseCur = latestProgress?.phase_current;
+  const phaseTot = latestProgress?.phase_total;
+  const showPhaseBar =
+    latestProgress?.phase != null &&
+    latestProgress.phase !== "crawling" &&
+    phaseCur != null &&
+    phaseTot != null &&
+    phaseTot > 0;
+
+  const crawlPct =
     activeMaxPages > 0 ? Math.min(100, (pagesCrawled / activeMaxPages) * 100) : 0;
+  const phasePct =
+    showPhaseBar && phaseTot ? Math.min(100, (phaseCur / phaseTot) * 100) : 0;
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
@@ -251,6 +331,7 @@ export function NewAuditPage() {
                 </span>
                 <span className="mt-0.5 block text-xs text-gray-500">
                   Off by default. Requires a PageSpeed API key on the backend when enabled.
+                  On large crawls this step can take several minutes.
                 </span>
               </span>
             </label>
@@ -260,7 +341,7 @@ export function NewAuditPage() {
               disabled={submitting || polling}
               className="rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-brand-700 disabled:opacity-60"
             >
-              {polling ? "Crawling…" : submitting ? "Starting…" : "Start audit"}
+              {polling ? "Auditing…" : submitting ? "Starting…" : "Start audit"}
             </button>
           </form>
         </CardContent>
@@ -270,20 +351,25 @@ export function NewAuditPage() {
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
-              <CardTitle>Crawl progress</CardTitle>
+              <CardTitle>Audit progress</CardTitle>
               {status ? <StatusPill status={status} /> : null}
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
             <ProgressBar
-              value={progressPct}
+              value={crawlPct}
               label={`${pagesCrawled} / ${activeMaxPages} pages crawled`}
             />
-            <p className="text-xs text-gray-500">
-              Crawl in progress
-              {status === "enriching" ? " · Running sitemap checks & scoring…" : ""}
-              {status === "completed" ? " · Complete — opening dashboard…" : ""}
-            </p>
+            {showPhaseBar ? (
+              <ProgressBar
+                value={phasePct}
+                label={progressCopy(latestProgress, pagesCrawled, activeMaxPages)}
+              />
+            ) : (
+              <p className="text-xs text-gray-500">
+                {progressCopy(latestProgress, pagesCrawled, activeMaxPages)}
+              </p>
+            )}
             {!polling && status === "failed" ? (
               <p className="text-sm text-red-700">
                 This crawl failed. You can start a new one or check{" "}

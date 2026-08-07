@@ -12,6 +12,43 @@ from bs4 import BeautifulSoup
 from app.crawler.normalize import normalize_url
 
 WHITESPACE_RE = re.compile(r"\s+")
+_NON_FETCHABLE_SCHEMES = frozenset(
+    {"data", "blob", "javascript", "mailto", "tel", "about", "file"}
+)
+
+
+def is_http_url(url: str | None) -> bool:
+    """True only for absolute http(s) URLs safe to request with httpx."""
+    if not url or not str(url).strip():
+        return False
+    parsed = urlparse(str(url).strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _looks_like_data_uri(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith("data:") or ";base64," in lowered
+
+
+def _absolute_resource_url(page_url: str, raw: str | None) -> str | None:
+    """Resolve a resource URL; keep data: URIs, drop other non-http schemes."""
+    if not raw:
+        return None
+    src = str(raw).strip()
+    if not src:
+        return None
+    if _looks_like_data_uri(src):
+        # Keep original data URI — never urljoin (can mangle scheme-less leftovers).
+        if src.lower().startswith("data:"):
+            return src
+        return f"data:{src.lstrip('/')}" if src.lstrip("/").lower().startswith("image/") else None
+    absolute = urljoin(page_url, src)
+    parsed = urlparse(absolute)
+    if parsed.scheme in _NON_FETCHABLE_SCHEMES:
+        return None
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return absolute
+    return None
 
 
 @dataclass(slots=True)
@@ -194,10 +231,13 @@ def _extract_url_signals(url: str) -> dict[str, Any]:
 
 def _extract_social_tags(soup: BeautifulSoup, page_url: str) -> dict[str, str | None]:
     og_image_raw = _get_meta_property(soup, "og:image")
+    og_image = _absolute_resource_url(page_url, og_image_raw) if og_image_raw else None
+    if og_image and not is_http_url(og_image):
+        og_image = None
     return {
         "og_title": _get_meta_property(soup, "og:title"),
         "og_description": _get_meta_property(soup, "og:description"),
-        "og_image": urljoin(page_url, og_image_raw) if og_image_raw else None,
+        "og_image": og_image,
         "twitter_card": _get_meta_name_or_property(soup, "twitter:card"),
         "twitter_title": _get_meta_name_or_property(soup, "twitter:title"),
     }
@@ -331,7 +371,9 @@ def _extract_images(soup: BeautifulSoup, page_url: str) -> list[ExtractedImage]:
         src = tag.get("src")
         if not src:
             continue
-        absolute = urljoin(page_url, src)
+        absolute = _absolute_resource_url(page_url, src if isinstance(src, str) else str(src))
+        if not absolute:
+            continue
         width = _parse_int_attr(tag.get("width"))
         height = _parse_int_attr(tag.get("height"))
         images.append(
@@ -364,6 +406,13 @@ def _parse_int_attr(value: Any) -> int | None:
 
 
 def _file_extension(url: str) -> str | None:
+    if url.lower().startswith("data:"):
+        # data:image/png;base64,... → png
+        header = url.split(",", 1)[0]
+        mime = header[5:].split(";")[0].strip().lower()  # after "data:"
+        if "/" in mime:
+            return mime.split("/", 1)[1] or None
+        return None
     path = urlparse(url).path
     suffix = PurePosixPath(unquote(path)).suffix.lower().lstrip(".")
     return suffix or None

@@ -221,12 +221,29 @@ async def _step_crawl(ctx: AuditRunContext) -> StepResult:
             )
             or 0
         )
+    # Mark post-crawl enrichment so progress polls show checks are still running.
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="site_checks",
+        current=0,
+        total=None,
+        status="enriching",
+    )
     detail = f"crawl_pages populated ({page_count} page(s))"
     ctx.results["crawl"] = {"pages": page_count}
     return StepResult(step="crawl", ok=True, detail=detail)
 
 
 async def _step_site(ctx: AuditRunContext) -> StepResult:
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="site_checks",
+        current=0,
+        total=None,
+        status="enriching",
+    )
     start_url = resolve_start_url(
         ctx.crawl_id,
         start_url=ctx.start_url,
@@ -258,10 +275,29 @@ async def _step_site(ctx: AuditRunContext) -> StepResult:
 
 
 async def _step_page(ctx: AuditRunContext) -> StepResult:
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="page_checks",
+        current=0,
+        total=None,
+        status="enriching",
+    )
+
+    def _phase_progress(phase: str, current: int, total: int | None) -> None:
+        ctx.storage.set_run_phase(
+            ctx.crawl_id,
+            phase=phase,
+            current=current,
+            total=total,
+            status="enriching",
+        )
+
     writes = await run_page_checks(
         ctx.crawl_id,
         enable_pagespeed=ctx.enable_pagespeed,
         session_factory=ctx.session_factory,
+        phase_progress=_phase_progress,
     )
     detail = f"{len(writes)} PAGE check row(s) written"
     ctx.results["page"] = {"writes": len(writes)}
@@ -269,6 +305,14 @@ async def _step_page(ctx: AuditRunContext) -> StepResult:
 
 
 async def _step_cross_page(ctx: AuditRunContext) -> StepResult:
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="cross_page_checks",
+        current=0,
+        total=None,
+        status="enriching",
+    )
     sitemap_urls: set[str] | None = None
     if ctx.site_cache is not None:
         sitemap_urls = ctx.site_cache.sitemap.page_urls
@@ -305,6 +349,14 @@ async def _step_cross_page(ctx: AuditRunContext) -> StepResult:
 
 
 async def _step_homepage(ctx: AuditRunContext) -> StepResult:
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="homepage_checks",
+        current=0,
+        total=None,
+        status="enriching",
+    )
     start_url = resolve_start_url(
         ctx.crawl_id,
         start_url=ctx.start_url,
@@ -321,6 +373,14 @@ async def _step_homepage(ctx: AuditRunContext) -> StepResult:
 
 
 async def _step_finish(ctx: AuditRunContext) -> StepResult:
+    await asyncio.to_thread(
+        ctx.storage.set_run_phase,
+        ctx.crawl_id,
+        phase="scoring",
+        current=0,
+        total=None,
+        status="enriching",
+    )
     # Scores from persisted site_issues + page_issues (runners own issue writes).
     try:
         from app.rules.engine import RuleEngine
@@ -329,7 +389,7 @@ async def _step_finish(ctx: AuditRunContext) -> StepResult:
         ctx.results["scores"] = score_result
     except Exception as exc:
         logger.exception("Score computation failed for crawl %s: %s", ctx.crawl_id, exc)
-        ctx.storage.set_run_failed(ctx.crawl_id)
+        ctx.storage.set_run_failed(ctx.crawl_id, error_message=str(exc))
         return StepResult(step="finish", ok=False, detail=str(exc))
 
     ctx.storage.set_run_completed(ctx.crawl_id)
@@ -355,10 +415,10 @@ async def run_step(ctx: AuditRunContext, step: str) -> StepResult:
     logger.info("Audit step %s starting for crawl %s", canonical, ctx.crawl_id)
     try:
         result = await handler(ctx)
-    except Exception:
+    except Exception as exc:
         logger.exception("Audit step %s failed for crawl %s", canonical, ctx.crawl_id)
         if canonical != "finish":
-            ctx.storage.set_run_failed(ctx.crawl_id)
+            ctx.storage.set_run_failed(ctx.crawl_id, error_message=str(exc))
         raise
     logger.info(
         "Audit step %s finished for crawl %s: %s",

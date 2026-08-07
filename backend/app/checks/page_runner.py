@@ -949,6 +949,7 @@ async def collect_pagespeed_for_pages(
     strategy: str = "mobile",
     client: httpx.AsyncClient | None = None,
     session_factory: Callable[[], Session] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[int, tuple[PagespeedMetrics | None, str | None, str | None]]:
     """Return page_id → (metrics | None, error | None, skipped_reason | None).
 
@@ -957,6 +958,24 @@ async def collect_pagespeed_for_pages(
     """
     results: dict[int, tuple[PagespeedMetrics | None, str | None, str | None]] = {}
     api_key = settings.PAGESPEED_API_KEY
+    total = len(pages)
+    done = 0
+    progress_lock = asyncio.Lock()
+
+    async def _bump() -> None:
+        nonlocal done
+        async with progress_lock:
+            done += 1
+            current = done
+        if progress_callback is None:
+            return
+        # Throttle DB writes; always emit first + last.
+        if current != 1 and current != total and current % 5 != 0:
+            return
+        try:
+            await asyncio.to_thread(progress_callback, current, total)
+        except Exception:  # noqa: BLE001 — progress must not break enrichment
+            logger.debug("PageSpeed progress callback failed", exc_info=True)
 
     need_fetch: list[PageSnapshot] = []
     for page in pages:
@@ -971,10 +990,13 @@ async def collect_pagespeed_for_pages(
                     exc,
                 )
                 need_fetch.append(page)
+                continue
+            await _bump()
             continue
 
         if not enable_pagespeed:
             results[page.id] = (None, None, "PageSpeed not enabled for this run.")
+            await _bump()
             continue
         if not api_key:
             results[page.id] = (
@@ -982,6 +1004,7 @@ async def collect_pagespeed_for_pages(
                 None,
                 "PageSpeed skipped: PAGESPEED_API_KEY is not configured.",
             )
+            await _bump()
             continue
         if page.status_code is not None and page.status_code >= 400:
             results[page.id] = (
@@ -989,6 +1012,7 @@ async def collect_pagespeed_for_pages(
                 None,
                 "PageSpeed skipped: page returned an error status.",
             )
+            await _bump()
             continue
         need_fetch.append(page)
 
@@ -1026,6 +1050,8 @@ async def collect_pagespeed_for_pages(
                     "PageSpeed check failed for %s: %s", page.url, exc
                 )
                 results[page.id] = (None, str(exc) or "PageSpeed check failed", None)
+            finally:
+                await _bump()
 
     try:
         await asyncio.gather(*(fetch_one(page) for page in need_fetch))
@@ -1161,6 +1187,7 @@ async def run_page_checks(
     strategy: str = "mobile",
     client: httpx.AsyncClient | None = None,
     session_factory: Callable[[], Session] | None = None,
+    phase_progress: Callable[[str, int, int | None], None] | None = None,
 ) -> list[PageCheckWrite]:
     """Load crawl_pages, run PAGE checks, persist page_issues.
 
@@ -1174,14 +1201,29 @@ async def run_page_checks(
         return []
 
     run_ps = settings.ENABLE_PAGESPEED if enable_pagespeed is None else enable_pagespeed
+
+    def _ps_progress(current: int, total: int) -> None:
+        if phase_progress is not None:
+            phase_progress("pagespeed" if run_ps else "page_checks", current, total)
+
+    if phase_progress is not None:
+        await asyncio.to_thread(
+            phase_progress, "pagespeed" if run_ps else "page_checks", 0, len(pages)
+        )
+
     pagespeed_by_id = await collect_pagespeed_for_pages(
         pages,
         enable_pagespeed=run_ps,
         strategy=strategy,
         client=client,
         session_factory=factory,
+        progress_callback=_ps_progress,
     )
+    if phase_progress is not None:
+        await asyncio.to_thread(phase_progress, "page_checks", 0, len(pages))
     # CPU-bound BeautifulSoup / check evaluation must not block the API event loop.
     writes = await asyncio.to_thread(evaluate_page_checks, pages, pagespeed_by_id)
     await asyncio.to_thread(persist_page_issues, crawl_id, writes, session_factory=factory)
+    if phase_progress is not None:
+        await asyncio.to_thread(phase_progress, "page_checks", len(pages), len(pages))
     return writes

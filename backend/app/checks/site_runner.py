@@ -7,6 +7,7 @@ and writes exactly one site_issues row per check.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -605,8 +606,12 @@ async def run_site_checks(
 
     snapshot = crawl_snapshot
     if snapshot is None and load_snapshot_from_db:
-        snapshot = load_crawl_snapshot(crawl_id, session_factory=factory)
+        snapshot = await asyncio.to_thread(
+            load_crawl_snapshot, crawl_id, session_factory=factory
+        )
 
-    writes = evaluate_site_checks(asset_cache, snapshot)
-    persist_site_issues(crawl_id, writes, session_factory=factory)
+    writes = await asyncio.to_thread(evaluate_site_checks, asset_cache, snapshot)
+    await asyncio.to_thread(
+        persist_site_issues, crawl_id, writes, session_factory=factory
+    )
     return asset_cache, writes

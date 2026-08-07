@@ -8,6 +8,7 @@ offending URLs). Never writes one row per URL for group findings.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -710,15 +711,20 @@ async def run_cross_page_checks(
     comparisons when a caller already has a SiteAssetCache.
     """
     factory = session_factory or SessionLocal
-    ctx = load_cross_page_context(
+    ctx = await asyncio.to_thread(
+        load_cross_page_context,
         crawl_id,
         sitemap_urls=sitemap_urls,
         session_factory=factory,
     )
     if not ctx.pages:
-        persist_cross_page_issues(crawl_id, [], session_factory=factory)
+        await asyncio.to_thread(
+            persist_cross_page_issues, crawl_id, [], session_factory=factory
+        )
         return []
 
-    writes = evaluate_cross_page_checks(ctx)
-    persist_cross_page_issues(crawl_id, writes, session_factory=factory)
+    writes = await asyncio.to_thread(evaluate_cross_page_checks, ctx)
+    await asyncio.to_thread(
+        persist_cross_page_issues, crawl_id, writes, session_factory=factory
+    )
     return writes

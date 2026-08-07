@@ -98,6 +98,10 @@ class CrawlStorage:
             status="running",
             started_at=datetime.now(UTC),
             finished_at=None,
+            phase="crawling",
+            phase_current=0,
+            phase_total=None,
+            error_message=None,
         )
 
     def set_run_completed(self, crawl_run_id: int) -> None:
@@ -105,6 +109,10 @@ class CrawlStorage:
             crawl_run_id,
             status="completed",
             finished_at=datetime.now(UTC),
+            phase="completed",
+            phase_current=None,
+            phase_total=None,
+            error_message=None,
         )
 
     def set_run_enriching(self, crawl_run_id: int) -> None:
@@ -113,11 +121,38 @@ class CrawlStorage:
             status="enriching",
         )
 
-    def set_run_failed(self, crawl_run_id: int) -> None:
+    def set_run_failed(
+        self,
+        crawl_run_id: int,
+        *,
+        error_message: str | None = None,
+    ) -> None:
         self._update_run_status(
             crawl_run_id,
             status="failed",
             finished_at=datetime.now(UTC),
+            phase="failed",
+            error_message=(error_message or "")[:2000] or None,
+        )
+
+    def set_run_phase(
+        self,
+        crawl_run_id: int,
+        *,
+        phase: str,
+        current: int | None = None,
+        total: int | None = None,
+        status: str | None = None,
+        error_message: str | None | object = ...,
+    ) -> None:
+        """Update live phase progress without changing finished_at."""
+        self._update_run_status(
+            crawl_run_id,
+            status=status if status is not None else ...,
+            phase=phase,
+            phase_current=current,
+            phase_total=total,
+            error_message=error_message,
         )
 
     def save_site_checks(
@@ -152,19 +187,32 @@ class CrawlStorage:
         self,
         crawl_run_id: int,
         *,
-        status: str,
+        status: str | object = ...,
         started_at: datetime | None | object = ...,
         finished_at: datetime | None | object = ...,
+        phase: str | None | object = ...,
+        phase_current: int | None | object = ...,
+        phase_total: int | None | object = ...,
+        error_message: str | None | object = ...,
     ) -> None:
         with self._session_factory() as db:
             crawl_run = db.get(CrawlRun, crawl_run_id)
             if crawl_run is None:
                 return
-            crawl_run.status = status
+            if status is not ...:
+                crawl_run.status = status  # type: ignore[assignment]
             if started_at is not ...:
-                crawl_run.started_at = started_at
+                crawl_run.started_at = started_at  # type: ignore[assignment]
             if finished_at is not ...:
-                crawl_run.finished_at = finished_at
+                crawl_run.finished_at = finished_at  # type: ignore[assignment]
+            if phase is not ...:
+                crawl_run.phase = phase  # type: ignore[assignment]
+            if phase_current is not ...:
+                crawl_run.phase_current = phase_current  # type: ignore[assignment]
+            if phase_total is not ...:
+                crawl_run.phase_total = phase_total  # type: ignore[assignment]
+            if error_message is not ...:
+                crawl_run.error_message = error_message  # type: ignore[assignment]
             db.commit()
 
     def _write_batch(self, batch: list[PendingPage]) -> int:

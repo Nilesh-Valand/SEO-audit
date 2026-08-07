@@ -48,6 +48,30 @@ class CrawlRunProgressResponse(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     active: bool
+    phase: str | None = None
+    phase_current: int | None = None
+    phase_total: int | None = None
+    phase_label: str | None = None
+    error_message: str | None = None
+
+
+_PHASE_LABELS: dict[str, str] = {
+    "crawling": "Crawling pages",
+    "site_checks": "Running site checks",
+    "page_checks": "Running page checks",
+    "pagespeed": "Running PageSpeed checks",
+    "cross_page_checks": "Running cross-page checks",
+    "homepage_checks": "Running homepage checks",
+    "scoring": "Calculating scores",
+    "completed": "Completed",
+    "failed": "Failed",
+}
+
+
+def _phase_label(phase: str | None) -> str | None:
+    if not phase:
+        return None
+    return _PHASE_LABELS.get(phase, phase.replace("_", " ").capitalize())
 
 
 class CrawlRunListItemResponse(BaseModel):
@@ -409,6 +433,11 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
         active=is_active(crawl_run.id) or any(
             not t.done() and t.get_name() == f"orphan-audit-{crawl_run.id}" for t in _ACTIVE_ORPHAN_TASKS
         ),
+        phase=getattr(crawl_run, "phase", None),
+        phase_current=getattr(crawl_run, "phase_current", None),
+        phase_total=getattr(crawl_run, "phase_total", None),
+        phase_label=_phase_label(getattr(crawl_run, "phase", None)),
+        error_message=getattr(crawl_run, "error_message", None),
     )
 
 

@@ -38,6 +38,11 @@ export type CrawlRunProgress = {
   started_at: string | null;
   finished_at: string | null;
   active: boolean;
+  phase?: string | null;
+  phase_current?: number | null;
+  phase_total?: number | null;
+  phase_label?: string | null;
+  error_message?: string | null;
 };
 
 export type CrawlRunSummary = {
@@ -282,7 +287,7 @@ export const apiClient = {
     }),
   deleteCrawlRun: (id: number) => api.delete(`/api/crawl-runs/${id}`),
   getCrawlRun: (id: number) =>
-    api.get<CrawlRunProgress>(`/api/crawl-runs/${id}`, { timeoutMs: 30_000 }),
+    api.get<CrawlRunProgress>(`/api/crawl-runs/${id}`, { timeoutMs: 15_000 }),
   runAudit: (id: number) =>
     api.post<{ crawl_run_id: number; issues_created: number; scores_created: number }>(
       `/api/crawl-runs/${id}/run-audit`,

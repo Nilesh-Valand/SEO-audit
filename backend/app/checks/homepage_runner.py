@@ -8,6 +8,7 @@ for reference. Never evaluates these checks on any other page.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -279,8 +280,11 @@ async def run_homepage_checks(
     non-homepage pages.
     """
     factory = session_factory or SessionLocal
-    page = load_homepage_snapshot(
-        crawl_id, start_url=start_url, session_factory=factory
+    page = await asyncio.to_thread(
+        load_homepage_snapshot,
+        crawl_id,
+        start_url=start_url,
+        session_factory=factory,
     )
     if page is None:
         logger.warning(
@@ -288,9 +292,13 @@ async def run_homepage_checks(
             crawl_id,
             start_url,
         )
-        persist_homepage_issues(crawl_id, [], session_factory=factory)
+        await asyncio.to_thread(
+            persist_homepage_issues, crawl_id, [], session_factory=factory
+        )
         return []
 
-    writes = evaluate_homepage_checks(page)
-    persist_homepage_issues(crawl_id, writes, session_factory=factory)
+    writes = await asyncio.to_thread(evaluate_homepage_checks, page)
+    await asyncio.to_thread(
+        persist_homepage_issues, crawl_id, writes, session_factory=factory
+    )
     return writes
