@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 from collections import deque
@@ -28,11 +29,11 @@ logger = logging.getLogger(__name__)
 _MAX_WEIGHT_RESOURCES = 40
 
 try:
-    from playwright.async_api import Browser, Error as PlaywrightError, async_playwright
+    from playwright.sync_api import Browser, Error as PlaywrightError, sync_playwright
 except Exception:  # pragma: no cover - import may fail when browsers are not installed
     Browser = None  # type: ignore[misc, assignment]
     PlaywrightError = Exception
-    async_playwright = None
+    sync_playwright = None
 
 
 @dataclass(slots=True)
@@ -82,8 +83,13 @@ class CrawlerService:
         self._last_request_at: dict[str, float] = {}
         self._host_locks: dict[str, asyncio.Lock] = {}
         self._robots_cache: dict[str, Protego] = {}
+        # Sync Playwright runs on a dedicated 1-thread executor so Windows uvicorn
+        # SelectorEventLoop (no subprocess support) cannot break Chromium launch.
+        self._pw_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="playwright"
+        )
+        self._sync_playwright = None
         self._browser: Browser | None = None
-        self._playwright = None
         self._playwright_failed = False
 
     async def crawl(self, crawl_run_id: int) -> None:
@@ -271,15 +277,26 @@ class CrawlerService:
         client: httpx.AsyncClient,
         url: str,
     ) -> ExtractedPage | None:
-        browser = await self._ensure_browser()
+        del client  # HTTP client not used; Playwright fetches the page itself.
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                self._pw_executor, self._fetch_with_playwright_sync, url
+            )
+        except Exception as exc:
+            logger.warning("Playwright render failed for %s: %s", url, exc)
+            return None
+
+    def _fetch_with_playwright_sync(self, url: str) -> ExtractedPage | None:
+        browser = self._ensure_browser_sync()
         if browser is None:
             return None
 
-        page = await browser.new_page(user_agent=self.user_agent)
+        page = browser.new_page(user_agent=self.user_agent)
         try:
             started = time.perf_counter()
-            response = await page.goto(url, wait_until="networkidle", timeout=30000)
-            html = await page.content()
+            response = page.goto(url, wait_until="networkidle", timeout=30000)
+            html = page.content()
             elapsed_ms = (time.perf_counter() - started) * 1000
             return extract_page_data(
                 url=page.url,
@@ -293,7 +310,49 @@ class CrawlerService:
         except PlaywrightError:
             return None
         finally:
-            await page.close()
+            page.close()
+
+    def _ensure_browser_sync(self) -> Browser | None:
+        if self._browser is not None:
+            return self._browser
+        if sync_playwright is None or not self.render_js_when_thin:
+            return None
+        if self._playwright_failed:
+            return None
+
+        try:
+            self._sync_playwright = sync_playwright().start()
+            self._browser = self._sync_playwright.chromium.launch(headless=True)
+            return self._browser
+        except Exception as exc:
+            logger.warning(
+                "Playwright unavailable, continuing with HTML crawl only: %s", exc
+            )
+            self._playwright_failed = True
+            self._browser = None
+            self._sync_playwright = None
+            return None
+
+    async def _close_playwright(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self._pw_executor, self._close_playwright_sync)
+        finally:
+            self._pw_executor.shutdown(wait=False, cancel_futures=False)
+
+    def _close_playwright_sync(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._sync_playwright is not None:
+            try:
+                self._sync_playwright.stop()
+            except Exception:
+                pass
+            self._sync_playwright = None
 
     async def _enrich_page_signals(self, client: httpx.AsyncClient, page: ExtractedPage) -> None:
         if page.favicon_in_html:
@@ -375,39 +434,6 @@ class CrawlerService:
             # Unsupported schemes / network errors — treat as zero weight.
             return 0
 
-    async def _ensure_browser(self) -> Browser | None:
-        if self._browser is not None:
-            return self._browser
-        if async_playwright is None or not self.render_js_when_thin:
-            return None
-        if self._playwright_failed:
-            return None
-
-        try:
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(headless=True)
-            return self._browser
-        except Exception as exc:
-            logger.warning("Playwright unavailable, continuing with HTML crawl only: %s", exc)
-            self._playwright_failed = True
-            self._browser = None
-            self._playwright = None
-            return None
-
-    async def _close_playwright(self) -> None:
-        if self._browser is not None:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
-
     async def _is_allowed_by_robots(self, client: httpx.AsyncClient, url: str) -> bool:
         parsed = urlparse(url)
         host = parsed.hostname
@@ -452,7 +478,7 @@ class CrawlerService:
             and page.html is not None
             and (page.status_code is None or page.status_code < 400)
             and page.word_count < self.thin_content_threshold
-            and async_playwright is not None
+            and sync_playwright is not None
         )
 
     async def _periodic_flush(self, stop_event: asyncio.Event) -> None:
