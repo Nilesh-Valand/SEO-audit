@@ -375,9 +375,9 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
     crawl_run = _require_crawl_run(crawl_run_id)
     active = is_active(crawl_run.id)
 
-    # Heal runs left in running/enriching after a server reload killed the worker.
+    # Heal runs left in pending/running/enriching after a server reload killed the worker.
     # Keep this path fast — never run the full rules engine inline on poll requests.
-    if crawl_run.status in {"running", "enriching"} and not active:
+    if crawl_run.status in {"pending", "running", "enriching"} and not active:
         with SessionLocal() as db:
             page_count = (
                 db.scalar(
@@ -420,7 +420,13 @@ async def get_crawl_run(crawl_run_id: int) -> CrawlRunProgressResponse:
                 task.add_done_callback(_ACTIVE_ORPHAN_TASKS.discard)
             crawl_run = _require_crawl_run(crawl_run_id)
         else:
-            storage.set_run_failed(crawl_run_id)
+            storage.set_run_failed(
+                crawl_run_id,
+                error_message=(
+                    "Crawl worker stopped before finishing (often caused by uvicorn reload). "
+                    "Start the server with `--reload-dir app`, then start a new audit."
+                ),
+            )
             crawl_run = _require_crawl_run(crawl_run_id)
 
     return CrawlRunProgressResponse(

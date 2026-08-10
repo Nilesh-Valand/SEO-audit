@@ -19,6 +19,21 @@ from app.api.projects import router as projects_router
 
 app = FastAPI(title="SEO Audit API", version="0.1.0")
 
+# Always allow the Next.js web app in local development (in addition to ALLOWED_ORIGINS).
+_DEV_WEB_ORIGINS = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
+
+
+def _cors_allow_origins() -> list[str]:
+    origins = list(settings.allowed_origins)
+    if settings.ENV == "development":
+        for origin in _DEV_WEB_ORIGINS:
+            if origin not in origins:
+                origins.append(origin)
+    return origins
+
 
 class ChromeExtensionCorsMiddleware(BaseHTTPMiddleware):
     """In development, reflect chrome-extension:// origins so unpacked IDs work
@@ -51,10 +66,11 @@ class ChromeExtensionCorsMiddleware(BaseHTTPMiddleware):
         return response
 
 
-if settings.allowed_origins:
+_cors_origins = _cors_allow_origins()
+if _cors_origins:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.allowed_origins,
+        allow_origins=_cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

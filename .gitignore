@@ -21,11 +21,22 @@ backend/data/snapshots/*
 # Legacy crawl snapshot location (repo root)
 .crawl_data/
 
-# Chrome extension build artifacts
+# Next.js web frontend
+frontend-web/node_modules/
+frontend-web/.next/
+frontend-web/out/
+frontend-web/.env.local
+frontend-web/.env*.local
+
+# Abandoned Next scaffold (do not commit)
+web/
+web/.next/
+web/node_modules/
+
+# Retired Chrome extension (removed; ignore if recreated locally)
+extension/
 extension/node_modules/
 extension/dist/
-extension/releases/
-extension/*.zip
 
 # Logs / OS
 *.log
