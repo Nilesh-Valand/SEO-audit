@@ -58,7 +58,7 @@ function isNavActive(pathname: string, to: string, end?: boolean): boolean {
 }
 
 export function Sidebar() {
-  const pathname = usePathname();
+  const pathname = usePathname() ?? "";
 
   return (
     <aside className="sticky top-0 z-20 flex h-screen w-72 shrink-0 flex-col self-start border-r border-slate-200 bg-white text-slate-700">
