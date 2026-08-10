@@ -27,6 +27,9 @@ extension/dist/
 extension/releases/
 extension/*.zip
 
+# Leftover Next.js frontend (not used by extension/backend)
+frontend-web/
+
 # Logs / OS
 *.log
 .DS_Store
