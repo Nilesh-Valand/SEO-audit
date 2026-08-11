@@ -15,6 +15,7 @@ if sys.platform.startswith("win"):
 from app.config import settings
 from app.api.crawl_runs import router as crawl_runs_router
 from app.api.health import router as health_router
+from app.api.page_html import router as page_html_router
 from app.api.projects import router as projects_router
 
 app = FastAPI(title="SEO Audit API", version="0.1.0")
@@ -82,5 +83,6 @@ if settings.ENV == "development":
     app.add_middleware(ChromeExtensionCorsMiddleware)
 
 app.include_router(health_router, prefix="/api")
+app.include_router(page_html_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(crawl_runs_router, prefix="/api")

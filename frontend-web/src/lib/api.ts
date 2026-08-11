@@ -435,10 +435,7 @@ export const apiClient = {
       page_size?: number;
     },
   ) => api.get<PaginatedResponse<CrawledPage>>(`/api/crawl-runs/${id}/pages`, { query }),
-  /**
-   * Server-side HTML fetch for Current Page Check.
-   * Requires FastAPI `POST /api/page-html` (not implemented yet — see page contract).
-   */
+  /** Server-side HTML fetch for Current Page Check (`POST /api/page-html`). */
   fetchPageHtml: (url: string) =>
     api.post<PageHtmlResponse>(
       "/api/page-html",

@@ -16,6 +16,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui";
+import { IssueMessage } from "@/components/IssueMessage";
 import {
   labelCategory,
   PageShell,
@@ -620,7 +621,9 @@ export default function ReportPage() {
                             {issue.rule}
                           </span>
                         </div>
-                        <p className="mt-2 text-sm font-semibold text-slate-900">{issue.message}</p>
+                        <p className="mt-2">
+                          <IssueMessage message={issue.message} variant="full" />
+                        </p>
                       </li>
                     ))}
                   </ul>
@@ -671,9 +674,9 @@ export default function ReportPage() {
                                 {issue.rule}
                               </span>
                             </div>
-                            <p className="mt-2 text-sm font-semibold text-slate-900">
-                              {issue.message}
-                            </p>
+                            <div className="mt-2">
+                              <IssueMessage message={issue.message} variant="full" />
+                            </div>
                           </li>
                         ))}
                       </ul>
@@ -776,7 +779,9 @@ function DiffIssueList({ issues, emptyLabel }: { issues: DiffIssue[]; emptyLabel
               {issue.rule_id}
             </span>
           </div>
-          <p className="mt-2 text-sm font-medium text-slate-900">{issue.message}</p>
+          <div className="mt-2">
+            <IssueMessage message={issue.message} variant="headline" />
+          </div>
           <p className="mt-1 truncate text-xs text-slate-500" title={issue.target_url ?? undefined}>
             {issue.target_url ?? "—"}
           </p>

@@ -10,6 +10,7 @@ import {
   Search,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui";
+import { IssueMessage } from "@/components/IssueMessage";
 import {
   ISSUE_CATEGORIES,
   labelCategory,
@@ -265,9 +266,7 @@ export default function IssuesPage() {
                               {issue.rule_id}
                             </span>
                           </div>
-                          <p className="text-sm font-semibold leading-snug text-slate-900">
-                            {issue.message}
-                          </p>
+                          <IssueMessage message={issue.message} variant="headline" />
                           <p
                             className="truncate text-xs text-slate-500"
                             title={issue.target_url ?? undefined}
@@ -279,7 +278,17 @@ export default function IssuesPage() {
 
                       {open ? (
                         <div className="border-t border-slate-100 bg-slate-50/70 px-5 py-5 sm:pl-16">
-                          <IssueDetails details={issue.page_details} />
+                          <div className="space-y-5">
+                            <div>
+                              <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                                Finding details
+                              </div>
+                              <div className="mt-3">
+                                <IssueMessage message={issue.message} variant="full" />
+                              </div>
+                            </div>
+                            <IssueDetails details={issue.page_details} />
+                          </div>
                         </div>
                       ) : null}
                     </li>
